@@ -646,8 +646,25 @@ const RIVAL_DRIVER_NAMES = {
   horizon:['Felix Schneider','Theo Dubois'],
 };
 
+/* Fallback first/last name pools for generating fresh rookies once a team's
+   own fixed 2-name pool is exhausted (which happens almost immediately --
+   each team only has 2 names and both seats are normally filled from the
+   start). Built by splitting the existing RIVAL_DRIVER_NAMES into their
+   first/last components and cross-combining them (22x22 = 484 possible
+   combinations) rather than inventing a whole new name list, so generated
+   rookies stay in the same naming style already established. This replaced
+   the old "${nationality} Rookie" placeholder fallback, which was itself a
+   source of duplicate names (e.g. two different "Italy Rookie"s on the grid
+   at once) since it was never checked against other Rookie placeholders.
+   generateFreshDriverName() (engine.js) is the only thing that should read
+   these -- always call it rather than sampling RIVAL_DRIVER_NAMES directly,
+   so every call site gets the same global-uniqueness guarantee. */
+const FALLBACK_FIRST_NAMES = [...new Set(Object.values(RIVAL_DRIVER_NAMES).flat().map(n=>n.split(' ')[0]))];
+const FALLBACK_LAST_NAMES = [...new Set(Object.values(RIVAL_DRIVER_NAMES).flat().map(n=>n.split(' ')[1]))];
+
 const NATIONALITIES = ['Italy','Germany','Britain','France','Japan','Australia','Canada','Spain','Switzerland','Brazil','USA','Netherlands'];
 const FLAG_BY_NATION = {Italy:'🇮🇹',Germany:'🇩🇪',Britain:'🇬🇧',France:'🇫🇷',Japan:'🇯🇵',Australia:'🇦🇺',Canada:'🇨🇦',Spain:'🇪🇸',Switzerland:'🇨🇭',Brazil:'🇧🇷',USA:'🇺🇸',Netherlands:'🇳🇱'};
+
 
 /* idealSetup: the hidden "textbook" setup for this circuit (0-100 scale, matches
    the sliders in currentSetup). Downforce high = tight/twisty tracks, low = power
@@ -1127,6 +1144,45 @@ function makeRivalDriver(name, teamId){
   };
 }
 
+/* Generates a name for a new AI driver that is guaranteed unique against
+   EVERY name currently in use -- the whole grid plus the player -- not just
+   one team's own fixed pool. This is the fix for grid duplicate names: each
+   team's RIVAL_DRIVER_NAMES pool only has 2 entries and both are normally
+   already in use by that team's own two starting drivers, so the old
+   per-call-site filters (only excluding the retiring driver's own name, or
+   only checking that one team's existing drivers) let duplicates appear
+   almost immediately once any retirement/team-switch/legend-driver churn
+   happened -- confirmed reproducible from the very first simulated season.
+   Preference order: (1) the driver's own team pool, if a name in it isn't
+   currently used anywhere: keeps the flavor of "this team has always had
+   a Leclerc-and-Bianchi feel" as long as possible; (2) the cross-combined
+   fallback pool (484 combinations, see data.js); (3) an extremely unlikely
+   last resort of appending a Roman-numeral-style suffix, which only fires
+   if literally every combination in both pools is simultaneously in use. */
+function generateFreshDriverName(state, teamId){
+  const usedNames = new Set(state.grid.map(d=>d.name));
+  if(state.player) usedNames.add(state.player.name);
+
+  const ownPoolCandidates = (RIVAL_DRIVER_NAMES[teamId]||[]).filter(n=>!usedNames.has(n));
+  if(ownPoolCandidates.length) return pick(ownPoolCandidates);
+
+  const fallbackCandidates = [];
+  for(const first of FALLBACK_FIRST_NAMES){
+    for(const last of FALLBACK_LAST_NAMES){
+      const candidate = `${first} ${last}`;
+      if(!usedNames.has(candidate)) fallbackCandidates.push(candidate);
+    }
+  }
+  if(fallbackCandidates.length) return pick(fallbackCandidates);
+
+  // Last resort -- both pools (2 + up to 484 combinations) are entirely
+  // exhausted, which would need an implausibly long, high-churn career.
+  let suffix = 2;
+  let candidate;
+  do { candidate = `${pick(FALLBACK_FIRST_NAMES)} ${pick(FALLBACK_LAST_NAMES)} ${suffix}`; suffix++; } while(usedNames.has(candidate) && suffix < 50);
+  return candidate;
+}
+
 function generateGrid(playerTeamId){
   const grid = [];
   for(const team of TEAMS){
@@ -1164,8 +1220,7 @@ function rebalanceGridForTeamChange(state, oldTeamId, newTeamId){
   // this is the seat the player just vacated.
   const oldTeamDrivers = state.grid.filter(d=>d.teamId===oldTeamId);
   if(oldTeamDrivers.length < 2){
-    const usedNames = new Set(oldTeamDrivers.map(d=>d.name));
-    const freshName = pick((RIVAL_DRIVER_NAMES[oldTeamId]||[]).filter(n=>!usedNames.has(n))) || `${pick(NATIONALITIES)} Rookie`;
+    const freshName = generateFreshDriverName(state, oldTeamId);
     const replacement = makeRivalDriver(freshName, oldTeamId);
     replacement.age = randInt(19, 23);
     state.grid.push(replacement);
@@ -1183,7 +1238,7 @@ function createPlayer(config){
     careerStats:{ starts:0, wins:0, podiums:0, poles:0, fastestLaps:0, dnfs:0, points:0, wetWins:0 },
     trackFamiliarity:{}, relationships:{}, sponsors:[], sponsorHistory:[], milestones:[], journal:[],
     seasonAwardsWon:[], retired:false, difficulty: config.difficulty || 'Standard',
-    setupTrainingSessions:0, unlockedSponsorTiers:[1],
+    setupTrainingByTrack:{}, trainingActionsThisWeek:0, trainingWeekTracker:undefined, unlockedSponsorTiers:[1],
   };
 }
 
@@ -1414,7 +1469,14 @@ function simulateRace(grid, playerDriver, qualyResults, track, weather, playerSt
     // A hot track wears equipment faster (higher failChance); a cold one is
     // gentler on the car. saveTires strategy still helps on top of this.
     const tireWearMult = band ? band.tireWearMult : 1;
-    const failChance = clamp((100-baseReliability)*0.0009*tireWearMult*disciplineRelief, 0.001, 0.28);
+    // Reliability gap from 100 is raised to a difficulty-scaled exponent
+    // (>1 at Realistic, <1 at Casual) before scaling -- this widens the risk
+    // gap between a strong car (safely near-0% regardless of difficulty) and
+    // a weak one (meaningfully riskier at Realistic than the old flat-linear
+    // formula gave it) rather than punishing every tier by the same fixed
+    // ratio. Driver discipline and track heat still apply on top either way.
+    const reliabilityGap = Math.max(0, 100 - baseReliability);
+    const failChance = clamp(Math.pow(reliabilityGap, diff.dnfExponent) * diff.dnfMult * tireWearMult * disciplineRelief, 0.001, diff.dnfCap);
     const dnf = Math.random() < failChance;
     // Defending: a strong defender is more consistent under pressure from
     // cars around them -- shrinks (doesn't eliminate) their share of the
@@ -1438,9 +1500,9 @@ function simulateRace(grid, playerDriver, qualyResults, track, weather, playerSt
 }
 
 const DIFFICULTY_SETTINGS = {
-  Casual:     { setupWindow:1.4, tireForgiveness:1.3, reliabilityBonus:8,  sponsorGoalMult:0.75, aiStrength:0.9,  aiDevMult:0.7 },
-  Standard:   { setupWindow:1.0, tireForgiveness:1.0, reliabilityBonus:0,  sponsorGoalMult:1.0,  aiStrength:1.0,  aiDevMult:1.0 },
-  Realistic:  { setupWindow:0.7, tireForgiveness:0.75,reliabilityBonus:-6, sponsorGoalMult:1.3,  aiStrength:1.12, aiDevMult:1.35 },
+  Casual:     { setupWindow:1.4, tireForgiveness:1.3, reliabilityBonus:8,  sponsorGoalMult:0.75, aiStrength:0.9,  aiDevMult:0.7,  dnfExponent:0.85, dnfMult:0.003,   dnfCap:0.22 },
+  Standard:   { setupWindow:1.0, tireForgiveness:1.0, reliabilityBonus:0,  sponsorGoalMult:1.0,  aiStrength:1.0,  aiDevMult:1.0,  dnfExponent:1.0,  dnfMult:0.0009,  dnfCap:0.28 },
+  Realistic:  { setupWindow:0.7, tireForgiveness:0.75,reliabilityBonus:-6, sponsorGoalMult:1.3,  aiStrength:1.12, aiDevMult:1.35, dnfExponent:1.35, dnfMult:0.00035, dnfCap:0.35 },
 };
 
 /* ---------- Car setup: hidden ideal + gradual hint reveal ----------
@@ -1472,19 +1534,24 @@ function trueIdealSetup(track, player){
 }
 
 /* Hint confidence grows with: track familiarity (Practice sessions at THIS
-   track feed knowledge of the track-side component) and total simulator/
-   driving training sessions logged (feeds knowledge of the player's own
-   tendency component). Returns 0-100. At low confidence the hint UI shows a
-   wide fuzzy band around the true value; at high confidence it narrows down
-   to a tight, near-exact recommendation. This makes the hint feel like it's
-   "revealing little by little", exactly as requested, without ever being
-   handed to the player for free. */
+   track feed knowledge of the track-side component) and simulator/driving
+   training sessions logged AT THIS SPECIFIC TRACK (feeds knowledge of the
+   player's own tendency component, for this circuit). Returns 0-100. At low
+   confidence the hint UI shows a wide fuzzy band around the true value; at
+   high confidence it narrows down to a tight, near-exact recommendation.
+   This makes the hint feel like it's "revealing little by little", exactly
+   as requested, without ever being handed to the player for free.
+   Training confidence is intentionally PER-TRACK (p.setupTrainingByTrack),
+   not a global lifetime count -- a global count meant training once, at
+   any track, permanently maxed the confidence floor on every future track
+   including ones never visited, removing any reason to keep training once
+   that lifetime count was maxed early in a career. */
 function setupHintConfidence(state, trackId){
   const p = state.player;
   const familiarity = p.trackFamiliarity[trackId] || 65; // 65-100
   const familiarityConfidence = clamp((familiarity-65)/35 * 60, 0, 60); // up to 60 pts from track knowledge
-  const trainingSessions = p.setupTrainingSessions || 0;
-  const trainingConfidence = clamp(trainingSessions * 6, 0, 40); // up to 40 pts from driver-tendency knowledge
+  const trainingSessions = (p.setupTrainingByTrack && p.setupTrainingByTrack[trackId]) || 0;
+  const trainingConfidence = clamp(trainingSessions * 6, 0, 40); // up to 40 pts from driver-tendency knowledge AT THIS TRACK
   return clamp(Math.round(familiarityConfidence + trainingConfidence), 0, 100);
 }
 
@@ -1650,7 +1717,7 @@ function processGridRetirements(state){
     const chance = retirementChanceForAge(driver.age);
     if(chance > 0 && Math.random() < chance){
       retirees.push({ name: driver.name, teamId: driver.teamId });
-      const freshName = pick((RIVAL_DRIVER_NAMES[driver.teamId]||[]).filter(n=>n!==driver.name)) || `${pick(NATIONALITIES)} Rookie`;
+      const freshName = generateFreshDriverName(state, driver.teamId);
       const replacement = makeRivalDriver(freshName, driver.teamId);
       replacement.age = randInt(19, 23); // replacements always enter as young rookies
       state.grid[idx] = replacement;
@@ -1960,7 +2027,8 @@ const App = {
         this.state = parsed;
         this.syncTeamsFromState();
         if(!this.state.cosmetics) this.state.cosmetics = this.initialCosmeticsState();
-        if(!this.state.player.setupTrainingSessions) this.state.player.setupTrainingSessions = 0;
+        if(!this.state.player.setupTrainingByTrack) this.state.player.setupTrainingByTrack = {};
+        if(this.state.player.trainingActionsThisWeek===undefined) this.state.player.trainingActionsThisWeek = 0;
         if(!this.state.prevTeamStrength) this.state.prevTeamStrength = Object.fromEntries(TEAMS.map(t=>[t.id, t.carStrength]));
         if(this.state.careerRetirementCount===undefined) this.state.careerRetirementCount = 0;
         if(!this.state.careerStartSeason) this.state.careerStartSeason = this.state.season;
@@ -2003,7 +2071,8 @@ const App = {
     // won't have these fields — initialize them defensively so old saves
     // keep working rather than crashing.
     if(!this.state.cosmetics) this.state.cosmetics = this.initialCosmeticsState();
-    if(!this.state.player.setupTrainingSessions) this.state.player.setupTrainingSessions = 0;
+    if(!this.state.player.setupTrainingByTrack) this.state.player.setupTrainingByTrack = {};
+    if(this.state.player.trainingActionsThisWeek===undefined) this.state.player.trainingActionsThisWeek = 0;
     if(!this.state.prevTeamStrength) this.state.prevTeamStrength = Object.fromEntries(TEAMS.map(t=>[t.id, t.carStrength]));
     if(this.state.careerRetirementCount===undefined) this.state.careerRetirementCount = 0;
     if(!this.state.careerStartSeason) this.state.careerStartSeason = this.state.season;
@@ -2428,6 +2497,10 @@ Object.assign(App, {
      system rather than only affecting gains. */
   renderTrainingModal(){
     const p = this.state.player; const s = this.state;
+    const WEEKLY_TRAINING_CAP = 3;
+    if(p.trainingWeekTracker !== s.week){ p.trainingWeekTracker = s.week; p.trainingActionsThisWeek = 0; }
+    const usedThisWeek = p.trainingActionsThisWeek||0;
+    const capReached = usedThisWeek >= WEEKLY_TRAINING_CAP;
     const PROGRAMS = [
       {id:'gym', label:'Gym Session', icon:'🏋️', cost:20, moneyCost:0.3, stat:'fitness', group:'lifestyle', facility:'gym'},
       {id:'sim_pace', label:'Sim: Race Pace', icon:'🖥️', cost:18, moneyCost:0.5, stat:'racePace', group:'driving', facility:'simulator'},
@@ -2443,11 +2516,12 @@ Object.assign(App, {
     this.openModal(`
       ${this.modalHeader('Training')}
       <div class="section-sub" style="margin:0;">Energy: ${Math.round(p.attributes.lifestyle.energy)}/100 · Money: $${p.money.toFixed(1)}M</div>
-      <div class="section-sub" style="margin:2px 0 10px;">Better facilities mean stronger gains, but pricier sessions too.</div>
+      <div class="section-sub" style="margin:2px 0 4px;">Better facilities mean stronger gains, but pricier sessions too.</div>
+      <div class="chip ${capReached?'red':'blue'}" style="margin-bottom:10px;">📅 Training this week: ${usedThisWeek}/${WEEKLY_TRAINING_CAP}${capReached?' — resets Monday':''}</div>
       <div class="stack-8">
         ${PROGRAMS.map(tp=>{
           const price = this.trainingMoneyCost(tp);
-          const canAfford = p.attributes.lifestyle.energy>=tp.cost && p.money>=price;
+          const canAfford = p.attributes.lifestyle.energy>=tp.cost && p.money>=price && !capReached;
           return `
           <button class="pbtn full" data-train="${tp.id}" style="justify-content:flex-start; text-align:left;" ${canAfford?'':'disabled'}>
             ${tp.icon} ${tp.label} <span style="margin-left:auto; font-size:8px; color:var(--ink-soft);">-${tp.cost} nrg · -$${price.toFixed(1)}M</span>
@@ -2473,12 +2547,21 @@ Object.assign(App, {
   },
 
   doTraining(tp){
-    const p = this.state.player;
+    const p = this.state.player; const s = this.state;
     const price = this.trainingMoneyCost(tp);
+    // Weekly training cap: separate from the energy budget, which alone let
+    // a player run 5-8 sessions in a single day and fully recharge within
+    // about a day and a half -- no real weekly pacing existed. This tracks
+    // against s.week (already incremented once per Mon-wrap in advanceDay())
+    // so it resets automatically with no extra bookkeeping needed elsewhere.
+    if(p.trainingWeekTracker !== s.week){ p.trainingWeekTracker = s.week; p.trainingActionsThisWeek = 0; }
+    const WEEKLY_TRAINING_CAP = 3;
+    if((p.trainingActionsThisWeek||0) >= WEEKLY_TRAINING_CAP){ this.toast(`Training cap reached for this week (${WEEKLY_TRAINING_CAP} sessions) — more opens up Monday.`); return; }
     if(p.attributes.lifestyle.energy < tp.cost){ this.toast('Too tired to train!'); return; }
     if(p.money < price){ this.toast('Not enough money for that session.'); return; }
     p.attributes.lifestyle.energy = clamp(p.attributes.lifestyle.energy - tp.cost);
     p.money = Math.round((p.money - price)*10)/10;
+    p.trainingActionsThisWeek = (p.trainingActionsThisWeek||0) + 1;
     const target = tp.group==='driving' ? p.attributes.driving : tp.group==='mental' ? p.attributes.mental : p.attributes.lifestyle;
     const before = target[tp.stat];
     const efficiency = clamp(1 - (before-70)/60, 0.25, 1);
@@ -2489,11 +2572,18 @@ Object.assign(App, {
     target[tp.stat] = clamp(before + gain, 0, 99);
     p.attributes.lifestyle.stress = clamp(p.attributes.lifestyle.stress + 3);
     // Simulator-based driving programs also build the crew's read on the
-    // player's personal setup tendency (feeds setupHintConfidence).
+    // player's personal setup tendency (feeds setupHintConfidence) -- kept
+    // PER-TRACK (this round's track, if any) rather than a global lifetime
+    // count, so training doesn't permanently max out the setup-confidence
+    // floor on every track including ones never actually visited.
     if(tp.id.startsWith('sim_')){
-      p.setupTrainingSessions = (p.setupTrainingSessions||0) + 1;
+      const round = this.getCurrentRound ? this.getCurrentRound() : null;
+      if(round){
+        if(!p.setupTrainingByTrack) p.setupTrainingByTrack = {};
+        p.setupTrainingByTrack[round.trackId] = (p.setupTrainingByTrack[round.trackId]||0) + 1;
+      }
     }
-    this.toast(`${tp.icon} ${tp.label} complete! +${gain} (-$${price.toFixed(1)}M)`);
+    this.toast(`${tp.icon} ${tp.label} complete! +${gain} (-$${price.toFixed(1)}M) · Training this week: ${p.trainingActionsThisWeek}/${WEEKLY_TRAINING_CAP}`);
     this.closeModal();
     this.saveState();
     this.rerenderCurrentScreen();
@@ -2702,15 +2792,47 @@ Object.assign(App, {
     const relationshipView = { friendship: d.respect||50, get affection(){ return d.respectMeter; }, set affection(v){ d.respectMeter = v; }, memories: d.memories };
     const npcShim = { ...d, role:'Rival Driver', personality: d.drivingStyle||'Competitive', relationship: relationshipView };
 
+    // Always-available options. "Study their driving style" is a small real
+    // benefit (not just flavor) -- a rival-specific analog to a technical
+    // briefing, scaled down since it costs no energy/money unlike training.
     const genericLines = [
       {label:'Respectful chat after the race', effect:()=>{ d.respect = clamp((d.respect||50)+5); }, result:`${d.name} appreciates the sportsmanship.`, memory:'Had a respectful post-race chat'},
       {label:'Compare notes on the track', effect:()=>{ p.attributes.mental.focus = clamp(p.attributes.mental.focus+2); d.respect = clamp((d.respect||50)+2); }, result:'A useful, focused exchange.', memory:'Compared notes on the track'},
+      {label:`Study ${d.name.split(' ')[0]}'s driving style`, effect:()=>{ p.attributes.mental.adaptability = clamp(p.attributes.mental.adaptability+1); }, result:`You pick up a small habit worth copying. Adaptability +1.`, memory:`Studied ${d.name}'s driving style`},
     ];
-    const lines = [...genericLines, ...this.getRomanceLinesFor(npcShim)];
+
+    const h2h = d.headToHead || {wins:0, losses:0};
+    const isTeammate = d.teamId===p.teamId;
+    const isCurrentRival = s.rivalId===d.id;
+    const situationalLines = [];
+
+    if(isTeammate){
+      situationalLines.push(
+        {label:'Push each other to go faster', effect:()=>{ p.attributes.mental.confidence=clamp(p.attributes.mental.confidence+3); this.adjustTeamMorale(p.teamId,2); }, result:'A friendly internal rivalry sharpens you both. Confidence +3.', memory:'Pushed each other to go faster as teammates'},
+        {label:'Align on team strategy', effect:()=>{ this.adjustTeamMorale(p.teamId,3); d.respect=clamp((d.respect||50)+3); }, result:'A united garage. Team chemistry improves.', memory:'Aligned on team strategy with teammate'},
+      );
+    } else if(isCurrentRival || d.rivalryLevel>=50){
+      situationalLines.push(
+        {label:'Get in their head before the next race', effect:()=>{ p.attributes.mental.confidence=clamp(p.attributes.mental.confidence+2); d.respect=clamp((d.respect||50)-3); }, result:'A little psychological edge, though it costs some goodwill.', memory:`Tried to get in ${d.name}'s head`},
+        {label:'Clear the air about the rivalry', effect:()=>{ d.respect=clamp((d.respect||50)+8); p.attributes.lifestyle.stress=clamp(p.attributes.lifestyle.stress-6); }, result:`The tension eases a little. Stress -6.`, memory:`Cleared the air with ${d.name} about their rivalry`},
+      );
+    } else if(h2h.wins + h2h.losses >= 3){
+      // Enough races together to have a real head-to-head story, even
+      // without being flagged as THE current rival.
+      const leading = h2h.wins > h2h.losses;
+      situationalLines.push(
+        {label: leading ? 'Needle them about the head-to-head' : 'Ask what they know that you don\'t',
+         effect:()=>{ if(leading){ p.attributes.mental.confidence=clamp(p.attributes.mental.confidence+2); d.respect=clamp((d.respect||50)-1); } else { p.attributes.mental.focus=clamp(p.attributes.mental.focus+3); } },
+         result: leading ? `A bit of banter about your ${h2h.wins}-${h2h.losses} record.` : `A humbling but useful conversation. Focus +3.`,
+         memory: leading ? `Needled ${d.name} about their head-to-head record` : `Asked ${d.name} for advice after a tough head-to-head`},
+      );
+    }
+
+    const lines = [...genericLines, ...situationalLines, ...this.getRomanceLinesFor(npcShim)];
 
     this.openModal(`
       ${this.modalHeader('Talk to '+d.name)}
-      <div class="section-sub">${TEAMS.find(t=>t.id===d.teamId).name} · ${d.drivingStyle||'Competitive'}</div>
+      <div class="section-sub">${TEAMS.find(t=>t.id===d.teamId).name} · ${d.drivingStyle||'Competitive'}${isTeammate?' · Teammate':''}${isCurrentRival?' · Your Rival':''}</div>
       <div class="stack-8">
         ${lines.map((l,i)=>`<button class="pbtn full" data-rline="${i}">${l.label}</button>`).join('')}
       </div>
@@ -2813,7 +2935,7 @@ Object.assign(App, {
         {label:'Ask about the car budget', effect:()=>{ n.relationship.trust=clamp(n.relationship.trust+3); }, result:`${n.name} appreciates you taking an interest.`, memory:'Asked about the budget'},
       ],
       'Chief Engineer': [
-        {label:'Talk car development plans', effect:()=>{ n.relationship.trust=clamp(n.relationship.trust+4); }, result:'You align on development priorities.', memory:'Discussed development plans'},
+        {label:'Ask what to develop next', effect:()=>{ n.relationship.trust=clamp(n.relationship.trust+4); }, result:this.suggestNextDevelopment(), memory:'Asked what to develop next'},
         {label:'Ask for a technical briefing', effect:()=>{ p.attributes.mental.focus=clamp(p.attributes.mental.focus+2); }, result:'A useful technical briefing. Focus +2.', memory:'Got a technical briefing'},
       ],
       'Race Engineer': [
@@ -3154,7 +3276,7 @@ Object.assign(App, {
         // Media facility bonus: a higher Media level makes the press team
         // better at spinning good answers into real reputation gains --
         // scales any POSITIVE mediaReputation change from this choice by up
-        // to +45% at Lv.5 (negative/neutral outcomes are never touched, so
+        // to +60% at Lv.5 (negative/neutral outcomes are never touched, so
         // this can only help, never punish a bad answer harder). This is
         // FACILITY_EFFECTS.media's "Boosts media reputation gains" promise,
         // now an actual mechanical effect instead of flavor text.
@@ -3453,7 +3575,22 @@ Object.assign(App, {
       </div>
 
       <div class="pixel-panel">
-        <div class="panel-title">This Week <span class="tag">${round ? TRACKS.find(t=>t.id===round.trackId).name : 'Off Week'}${round && round.isSprint ? ' 🏃' : ''}</span></div>
+        <div class="panel-title">${(()=>{
+          if(!round) return 'This Week <span class="tag">Off Week</span>';
+          const fridayIdx = DAYS_OF_WEEK.indexOf('Friday');
+          const daysUntilRace = fridayIdx - s.dayIndex;
+          const trackName = TRACKS.find(t=>t.id===round.trackId).name;
+          if(daysUntilRace<=0){
+            // Already Fri/Sat/Sun of this round's race weekend.
+            return `This Week <span class="tag">${trackName}${round.isSprint ? ' 🏃' : ''}</span>`;
+          }
+          // Race weekend hasn't started yet -- say so explicitly instead of
+          // naming the upcoming track as if it's already "this week", which
+          // previously made closing a race result feel like it jumped
+          // straight into the next race weekend when really only one day
+          // had passed and several free days remained.
+          return `This Week <span class="tag">Free — next race in ${daysUntilRace} day${daysUntilRace===1?'':'s'}</span>`;
+        })()}</div>
         <div style="display:flex; gap:4px; overflow-x:auto; padding-bottom:2px;">
           ${DAYS_OF_WEEK.map((d,i)=>{
             const act = RACE_WEEKEND_DAYS[d] || this.suggestedActivity(d);
@@ -3465,7 +3602,7 @@ Object.assign(App, {
             </div>`;
           }).join('')}
         </div>
-        <div class="section-sub" style="margin:6px 0 0;">Race weekends are fixed (Fri/Sat/Sun). Other days are yours to plan freely — icons are just a suggestion.</div>
+        <div class="section-sub" style="margin:6px 0 0;">Race weekends are fixed (Fri/Sat/Sun). Other days are yours to plan freely — icons are just a suggestion.${round ? ` Next up: <b>${TRACKS.find(t=>t.id===round.trackId).name}</b>.` : ''}</div>
         ${this.renderForecastChip(round)}
         <button class="pbtn full" id="btn-view-calendar" style="margin-top:8px;">📅 Season Calendar</button>
       </div>
@@ -3575,9 +3712,22 @@ Object.assign(App, {
     if(daysUntil<=0){
       const band = tempBand(round.trackTemp);
       const line = round.weather==='rain' ? `🌧️ Rain · ${round.trackTemp}°C` : `${band.icon} Clear · ${round.trackTemp}°C`;
-      return `<div class="chip mint" style="margin-top:6px;">📡 Forecast locked in: ${line}</div>`;
+      // Forecast-accuracy callback: compare the EARLIEST guess we ever showed
+      // for this round (captured below, only the first time) against the
+      // now-locked-in actual temperature. Purely a flavor line -- doesn't
+      // touch round.weather/trackTemp themselves, which stay exactly as
+      // fixed at calendar-build time.
+      let callback = '';
+      if(round._earlyGuess!==undefined){
+        const diff = Math.abs(round._earlyGuess - round.trackTemp);
+        callback = diff<=2
+          ? `<div class="chip mint" style="margin-top:4px;">🎯 Your crew's early guess of ~${round._earlyGuess}°C was spot on.</div>`
+          : `<div class="chip blue" style="margin-top:4px;">📋 Your crew predicted ~${round._earlyGuess}°C earlier in the week — it turned out to be ${round.trackTemp}°C.</div>`;
+      }
+      return `<div class="chip mint" style="margin-top:6px;">📡 Forecast locked in: ${line}</div>${callback}`;
     }
     const guess = forecastGuess(round, daysUntil);
+    if(round._earlyGuess===undefined) round._earlyGuess = guess.temp;
     const rangeText = guess.range>0 ? `${guess.temp-guess.range}–${guess.temp+guess.range}°C` : `${guess.temp}°C`;
     return `<div class="chip blue" style="margin-top:6px;">📡 Early forecast: roughly ${rangeText} (${guess.confidence}% confidence) — sharpens as the weekend nears</div>`;
   },
@@ -4034,7 +4184,12 @@ Object.assign(App, {
       ${top5}
       <button class="pbtn full gold" id="btn-close-quali" style="margin-top:12px;">Continue</button>
     `);
-    this.wireModalClose();
+    // No X close button -- same reasoning as the race result modal: results
+    // are already committed to state before this modal opens, so a bypass
+    // path that skips advanceDay() would desync dayIndex from the calendar.
+    const closeBtn = document.getElementById('modal-close-btn');
+    if(closeBtn) closeBtn.style.display = 'none';
+    if(this.activeModal) this.activeModal.onclick = null;
     document.getElementById('btn-close-quali').onclick = ()=>{
       this.closeModal();
       this.pushNews(`⏱️ Qualifying at ${track.name}: ${p.name} starts P${gridPos}.`);
@@ -4186,7 +4341,12 @@ Object.assign(App, {
       ${top5}
       <button class="pbtn full gold" id="btn-close-sprint" style="margin-top:12px;">Continue</button>
     `);
-    this.wireModalClose();
+    // No X close button -- same reasoning as the race/qualifying result
+    // modals: round.sprintCompleted and standings points are already
+    // committed before this modal opens.
+    const closeBtn = document.getElementById('modal-close-btn');
+    if(closeBtn) closeBtn.style.display = 'none';
+    if(this.activeModal) this.activeModal.onclick = null;
     document.getElementById('btn-close-sprint').onclick = ()=>{
       this.closeModal();
       this.pushNews(`🏃 Sprint at ${track.name}: ${p.name} finishes ${sprintPos?'P'+sprintPos:'DNF'}.`);
@@ -4196,11 +4356,38 @@ Object.assign(App, {
   },
 
   /* ---------------- RACE ---------------- */
+  /* Race Engineer advice: picks a short, situationally-aware line based on
+     actual conditions (hot/cold/rain) and the player's grid position on a
+     track where passing is hard -- reusing overtakeTier() (same helper the
+     Race Center screen already uses for its overtake-difficulty chip) so
+     "tough to pass here" is judged consistently everywhere in the game.
+     Pure content/logic, no new state, no sim changes -- the conditions and
+     grid position it reads are already computed elsewhere in this flow. */
+  raceEngineerAdvice(round, track){
+    const s = this.state;
+    const band = tempBand(round.trackTemp);
+    const isRain = round.weather==='rain';
+    const qualy = s.lastQualyResults;
+    const playerQ = qualy ? qualy.find(q=>q.driverId==='player') : null;
+    const gridPos = playerQ ? playerQ.position : null;
+    if(isRain) return "Rain out there — Save Tires might be the smarter call today.";
+    if(band.label==='Hot') return "Hot one today — tyres will go off fast, Save Tires is worth considering.";
+    if(gridPos!==null && gridPos>=12 && this.overtakeTier(track.overtakeDiff).label!=='Easy'){
+      return `You're starting P${gridPos} on a track where passing is tough — Defend could protect what we've got, or Attack if you want to gamble on it.`;
+    }
+    if(gridPos!==null && gridPos<=4){
+      return `Good grid slot, P${gridPos}. Push hard and control this from the front.`;
+    }
+    return null; // no situational advice -- fall back to the normal radio-personality line
+  },
+
   renderRaceStrategyPrompt(){
     const round = this.getCurrentRound();
     if(!round){ this.renderHub(); return; }
+    const track = TRACKS.find(t=>t.id===round.trackId);
     const engineer = this.state.npcRoster.find(n=>n.role==='Race Engineer');
-    const line = radioLine(engineer.personality, 'push');
+    const advice = this.raceEngineerAdvice(round, track);
+    const line = advice || radioLine(engineer.personality, 'push');
     const band = tempBand(round.trackTemp);
     const isRain = round.weather==='rain';
     const conditionsChip = isRain ? `🌧️ Rain · ${round.trackTemp}°C` : `${band.icon} ${band.label} · ${round.trackTemp}°C`;
@@ -4332,16 +4519,35 @@ Object.assign(App, {
 
     const playerQualy = qualy.find(q=>q.driverId==='player');
     this.openModal(this.renderRaceResultHtml(results, pos, playerResult.dnf, headline, moneyGain, fanGain, sponsorIncome, playerQualy, track));
-    this.wireModalClose();
-    const closeBtn = document.getElementById('btn-close-race');
-    closeBtn.onclick = ()=>{
+    // No X close button here -- this MUST resolve via Continue. The X button
+    // previously just removed the modal from the DOM (closeModal(), no
+    // re-render) while round.completed/s.calendar.currentRound had ALREADY
+    // been advanced above (lines ~519-524) regardless of which button the
+    // player clicked. That left s.dayIndex stuck on the old day while the
+    // calendar had silently moved to the NEXT round, and the stale hub
+    // underneath (never re-rendered) still showed the old track's race
+    // button -- clicking it then raced the wrong (next) track under the old
+    // track's banner. Same must-answer pattern as the podium interview /
+    // quiz / celebrity encounter modals elsewhere in this file.
+    const closeBtn = document.getElementById('modal-close-btn');
+    if(closeBtn) closeBtn.style.display = 'none';
+    if(this.activeModal) this.activeModal.onclick = null;
+    document.getElementById('btn-close-race').onclick = ()=>{
       this.closeModal();
       this.saveState();
       const advance = ()=>{
         if(s.calendar.currentRound >= s.calendar.rounds.length){
           this.handleSeasonEnd();
         } else {
+          // Tell the player plainly that the race weekend is over and free
+          // days are starting -- without this, the hub's "This Week" panel
+          // switching straight to the NEXT round's track name (even though
+          // it's really just the following Monday) previously read like the
+          // game had skipped ahead to another race weekend.
+          const nextRound = s.calendar.rounds[s.calendar.currentRound];
+          const nextTrack = nextRound ? TRACKS.find(t=>t.id===nextRound.trackId) : null;
           this.advanceDay();
+          if(nextTrack) this.toast(`📅 Race weekend's over — free days ahead before ${nextTrack.name}.`);
         }
       };
       // Podium interview: a short, race-result-triggered variant of the
@@ -4550,10 +4756,16 @@ Object.assign(App, {
     if(!dnf && pos<=3) fire('first_podium', `${p.name} scores their first career podium!`);
     if(!dnf && pos===1) fire('first_win', `${p.name} wins their first career race!`);
     if(p.careerStats.starts>=50) fire('50_starts', `${p.name} completes 50 career race starts.`);
+    if(p.careerStats.starts>=100) fire('100_starts', `${p.name} completes 100 career race starts.`);
+    if(p.careerStats.wins>=10) fire('10_wins', `${p.name} reaches 10 career race wins!`);
+    if(p.careerStats.poles>=5) fire('5_poles', `${p.name} claims their 5th career pole position.`);
     if(p.careerStats.points>=100) fire('100_points', `${p.name} passes 100 career championship points.`);
+    if(p.careerStats.points>=250) fire('250_points', `${p.name} passes 250 career championship points.`);
+    if(p.careerStats.points>=500) fire('500_points', `${p.name} passes 500 career championship points.`);
   },
 
 });
+
 
 
 
@@ -4794,6 +5006,50 @@ Object.assign(App, {
     const level = s.facilities[key]||0;
     return Math.round(4 * Math.pow(1.15, level) * 10) / 10;
   },
+
+  /* Concrete, level-aware description of each facility's real current
+     effect -- shown instead of static flavor text so a player can actually
+     see the number their money bought, not just take on faith that
+     "Boosts fitness training gains" is doing anything. Every multiplier
+     here mirrors the exact formula used at the real call site (doTraining()
+     in app_actions.js for gym/simulator, devSlotsMax() above for
+     engineering, facilityUpgradeCost() above for factory, the mediaBonus
+     calc in renderMediaModal() for media, the loyaltyRatePerSeason calc in
+     checkSponsorObjectives() for hospitality) so this can never drift out
+     of sync with what's actually applied. */
+  facilityEffectText(key){
+    const level = this.state.facilities[key]||1;
+    const pct = (mult) => Math.round((mult-1)*100);
+    switch(key){
+      case 'gym': {
+        const bonus = 1 + (level-1)*0.15;
+        return `Fitness training gains ${level>1?`+${pct(bonus)}% right now`:'boosted per level'} (Lv.${level}).`;
+      }
+      case 'simulator': {
+        const bonus = 1 + (level-1)*0.15;
+        return `Driving-skill training gains ${level>1?`+${pct(bonus)}% right now`:'boosted per level'} (Lv.${level}).`;
+      }
+      case 'engineering': {
+        const slots = this.devSlotsMax();
+        return `${slots} car development slot(s) this season (base 3, +1/level above Lv.1).`;
+      }
+      case 'factory': {
+        const discount = 1 - (level-1)*0.06;
+        return `Car upgrade costs ${level>1?`-${pct(2-discount)}% right now`:'cheaper per level'} (up to -24% at Lv.5).`;
+      }
+      case 'media': {
+        const bonus = 1 + (level-1)*0.15;
+        return `Good press answers ${level>1?`give +${pct(bonus)}% more media reputation right now`:'give bigger media reputation gains per level'} (up to +60% at Lv.5).`;
+      }
+      case 'hospitality': {
+        const rate = 0.04 + (level-1)*0.005;
+        return `Sponsor loyalty pay raises build ${Math.round(rate*100)}%/season right now (up to +40% cap either way).`;
+      }
+      default:
+        return FACILITY_EFFECTS[key] || '';
+    }
+  },
+
   /* Engineering facility raises how many development actions the player's
      team can take in a season -- base 3 slots at Lv.1, +1 slot per
      Engineering level above 1 (so Lv.5 Engineering gives 7 slots/season).
@@ -4804,6 +5060,48 @@ Object.assign(App, {
      (equivalently slot-limited) work in one step. */
   devSlotsMax(){
     return 3 + ((this.state.facilities.engineering||1)-1);
+  },
+
+  /* Chief Engineer's development recommendation -- pure read-only function
+     over state that already exists (team.upgrades, team.reliability,
+     team.devSlotsUsed, p.money). Makes no mutations, so it can't desync
+     from anything and needs no save-migration path. Priority order:
+     1. Reliability, if it's badly lagging the grid average AND the team's
+        own reliability upgrade level is also low (real DNF risk).
+     2. Otherwise, whichever of aero/engine/chassis/suspension has the
+        LOWEST upgrade level relative to the other three -- a simple
+        "balance the car" heuristic needing no new state.
+     3. If out of development slots this season, say so instead of
+        recommending a specific upgrade.
+     4. If the recommended upgrade is unaffordable right now, say that too. */
+  suggestNextDevelopment(){
+    const s = this.state; const p = s.player;
+    const team = this.getTeam(p.teamId);
+    const upgrades = team.upgrades || {aero:1,engine:1,chassis:1,suspension:1,reliability:1};
+
+    if((team.devSlotsUsed||0) >= this.devSlotsMax()){
+      return "We're out of development capacity this season — this will have to wait.";
+    }
+
+    const gridAvgReliability = TEAMS.reduce((sum,t)=>sum+t.reliability,0) / TEAMS.length;
+    const reliabilityLagging = team.reliability < gridAvgReliability - 1.5 && (upgrades.reliability||0) <= 3;
+    let recommendKey;
+    if(reliabilityLagging){
+      recommendKey = 'reliability';
+    } else {
+      const carKeys = ['aero','engine','chassis','suspension'];
+      recommendKey = carKeys.reduce((lowest,k)=> (upgrades[k]||0) < (upgrades[lowest]||0) ? k : lowest, carKeys[0]);
+    }
+
+    const labels = {aero:'Aero', engine:'Engine', chassis:'Chassis', suspension:'Suspension', reliability:'Reliability'};
+    if(recommendKey==='reliability'){
+      return "Reliability is lagging the field — we're leaving points on the table to DNFs. That should be next.";
+    }
+    const cost = this.carUpgradeCost(recommendKey);
+    if(p.money < cost){
+      return `${labels[recommendKey]} is what we need next, but we can't afford it yet ($${cost.toFixed(1)}M).`;
+    }
+    return `Our ${labels[recommendKey].toLowerCase()} program has fallen behind the rest of the car — that's where I'd spend our next development slot.`;
   },
 
   /* ---------------- TEAM & CAR ---------------- */
@@ -4843,6 +5141,7 @@ Object.assign(App, {
         <div class="panel-title">Car Development <span class="tag">$${p.money}M</span></div>
         <div class="section-sub" style="margin:0 0 4px;">Development slots this season: <b>${team.devSlotsUsed||0}/${this.devSlotsMax()}</b> <span style="color:var(--ink-soft);">(higher Engineering level = more slots)</span></div>
         <div class="section-sub" style="margin:0 0 8px;">Cost rises with each level — a higher Factory level softens the climb. You inherited this team's existing development, so a bigger team starts further along.</div>
+        <div class="chip blue" style="margin:0 0 8px; display:block;">🔧 ${this.suggestNextDevelopment()}</div>
         <div class="stack-8">
           ${upgrades.map(u=>{
             const price = this.carUpgradeCost(u.id);
@@ -4892,7 +5191,7 @@ Object.assign(App, {
                 <button class="pbtn small mint" data-facility="${k}" ${v>=5 || p.money<price ? 'disabled':''}>+$${price.toFixed(1)}M</button>
               </div>
               ${this.renderPixelBar(v*20,'confidence',5)}
-              <div class="section-sub" style="margin:4px 0 0;">${FACILITY_EFFECTS[k]}</div>
+              <div class="section-sub" style="margin:4px 0 0;">${this.facilityEffectText(k)}</div>
             </div>
           `;}).join('')}
         </div>
@@ -4934,7 +5233,19 @@ Object.assign(App, {
         p.money = Math.round((p.money-price)*10)/10;
         team.upgrades[key]++;
         team.devSlotsUsed++;
-        team.carStrength = clamp(team.carStrength+1, 0, 100);
+        // Diminishing returns: a team already well ahead of the grid average
+        // gains less carStrength per upgrade than one at or below it. Without
+        // this, a maxed Engineering facility gave a flat +1/upgrade x up to 7
+        // slots/season forever, with no AI rubber-band pulling the PLAYER's
+        // own team back down (that only applies to developTeamsForNewSeason's
+        // AI-side formula) -- so a good team could snowball indefinitely and
+        // the grid's pecking order never stayed competitive into a title
+        // defense. Full +1 up to grid average, tapering to +0.4 by +20 over
+        // average, floor of +0.25 so upgrades always do SOMETHING.
+        const gridAvg = TEAMS.reduce((sum,t)=>sum+t.carStrength,0) / TEAMS.length;
+        const aheadBy = Math.max(0, team.carStrength - gridAvg);
+        const gain = clamp(1 - aheadBy*0.03, 0.25, 1);
+        team.carStrength = clamp(Math.round((team.carStrength+gain)*10)/10, 0, 100);
         this.toast(`${key} upgraded to Lv.${team.upgrades[key]}! (-$${price.toFixed(1)}M, dev slot ${team.devSlotsUsed}/${this.devSlotsMax()} used)`);
         this.saveState();
         this.renderTeamScreen();
@@ -5375,6 +5686,14 @@ Object.assign(App, {
       rebalanceGridForTeamChange(s, p.teamId, offer.teamId);
       p.teamId = offer.teamId;
       p.contract = {teamId: offer.teamId, years: offer.years, salary: offer.salary};
+      // A mid-season team switch changes what's realistically achievable this
+      // season (e.g. a tier-1 team's "Finish in the Top 3" objective is
+      // meaningless after dropping to a tier-3 car) -- regenerate objectives
+      // for the new team rather than leaving stale ones on the books. This is
+      // a full reset, not a progress carry-over: a team switch is already a
+      // big enough season-defining event that starting the new objectives
+      // fresh is the simpler and more sensible behavior.
+      s.seasonObjectives = generateSeasonObjectives(s);
       this.toast(`🤝 You've signed with ${suitor.name}!`);
       this.pushNews(`🤝 ${p.name} leaves ${currentTeam.name} early to join ${suitor.name}.`);
       p.journal.unshift({season:s.season, week:s.week, title:'Mid-Season Switch', text:`Left ${currentTeam.name} early to sign with ${suitor.name} for ${offer.years} year(s) at $${offer.salary}M/season.`, icon:'📝'});
@@ -5406,8 +5725,19 @@ Object.assign(App, {
       this.pushNews(`🤝 Old contacts open a door — a stronger team takes notice of ${p.name}.`);
     }
     const otherTeams = TEAMS.filter(t=>t.id!==currentTeam.id && eligibleTiers.includes(t.tier)).sort(()=>Math.random()-0.5).slice(0,2);
+    // Team morale nudges the CURRENT team's renewal offer specifically -- a
+    // happy driver at a happy team gets a small raise offered to stay, a
+    // driver at a team with sour chemistry gets a slightly worse renewal.
+    // Same shape as the sponsor loyalty multiplier in checkSponsorObjectives
+    // (a relationship number scaling a monetary offer). Baseline morale is
+    // 65 (see getTeamMorale), so this is ±0.5% salary per morale point away
+    // from that baseline, capped at ±15% -- noticeable but never the whole
+    // story behind an offer.
+    const morale = this.getTeamMorale(currentTeam.id);
+    const moraleMult = clamp(1 + (morale-65)*0.005, 0.85, 1.15);
+    const renewalSalary = Math.max(1, Math.round((p.contract.salary+randInt(0,2)) * moraleMult * 10)/10);
     const offers = [
-      {teamId:currentTeam.id, years:randInt(1,2), salary:Math.max(1, p.contract.salary+randInt(0,2)), clause:pickContractClause(currentTeam)},
+      {teamId:currentTeam.id, years:randInt(1,2), salary:renewalSalary, clause:pickContractClause(currentTeam)},
       ...otherTeams.map(t=>({teamId:t.id, years:randInt(1,3), salary:Math.max(1, Math.round(t.carStrength/10)), clause:pickContractClause(t)})),
     ];
     this.openModal(`
@@ -5423,7 +5753,15 @@ Object.assign(App, {
         }).join('')}
       </div>
     `);
-    this.wireModalClose();
+    // No X close button -- p.contract.years is already 0 by the time this
+    // modal is reached (that's the trigger condition), so dismissing without
+    // picking an offer previously left the player with no valid contract at
+    // all, yet still able to freely race race weekends under no team --
+    // confirmed reproducible, not just a theoretical gap. Same must-resolve
+    // pattern as the season-wrap/race-result modals.
+    const closeBtn = document.getElementById('modal-close-btn');
+    if(closeBtn) closeBtn.style.display = 'none';
+    if(this.activeModal) this.activeModal.onclick = null;
     document.querySelectorAll('[data-offer]').forEach(btn=>{
       btn.onclick = ()=>{
         const o = offers[parseInt(btn.dataset.offer)];
