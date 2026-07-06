@@ -765,8 +765,22 @@ const RADIO_LINES = {
     dnf:["Car said nope. Sorry, boss.","Well that's one way to end a Sunday."],
   },
 };
+// Driving Style -> closest RADIO_LINES personality bank, so a rival's
+// earned style (fed into the npcShim.personality slot in
+// renderRivalProfileModal/renderRivalTalkModal, app_actions.js) actually
+// colors their radio-flavor lines instead of silently falling through to
+// Calm every time. Previously radioLine() only recognized the 4 literal
+// NPC personality keys (Calm/Energetic/Strict/Funny); a driving-style
+// value like 'Aggressive' or 'Tyre Saver' matched none of them and always
+// fell back to Calm with no visible connection to the style shown on the
+// driver's own card.
+const DRIVING_STYLE_TO_PERSONALITY = {
+  'Aggressive':'Energetic', 'Defensive':'Strict', 'Tyre Saver':'Calm',
+  'Balanced':'Calm', 'Smooth':'Calm', 'Late Braker':'Strict', 'Wet Weather Expert':'Calm',
+};
 function radioLine(personality, category){
-  const bank = RADIO_LINES[personality] || RADIO_LINES.Calm;
+  const resolved = DRIVING_STYLE_TO_PERSONALITY[personality] || personality;
+  const bank = RADIO_LINES[resolved] || RADIO_LINES.Calm;
   const lines = bank[category] || bank.points;
   return pick(lines);
 }
@@ -796,6 +810,37 @@ function rivalRadioLine(category, rivalName){
   const bank = RIVAL_RADIO_LINES[category];
   if(!bank) return null;
   return pick(bank).replace('{rival}', rivalName);
+}
+
+/* Rivalry origin flavor text: previously rivalries were purely numeric (see
+   REMAINING BACKLOG). Rolled ONCE per rival, right when updateRivalry()
+   (app_race.js) first crowns them (s.rivalId set for the first time), then
+   stored on the driver so it's stable for the life of that rivalry -- a
+   fresh roll every time the profile is opened would make it feel random
+   rather than like an actual origin story. Picked by how the rivalry
+   actually formed (head-to-head record at crowning time) so it reads as a
+   real callback rather than a disconnected flavor line. */
+const RIVALRY_ORIGINS = {
+  playerLeading: [
+    "Started when you out-qualified them at a track they'd owned for years.",
+    "It began the day you passed them for a podium they thought was theirs.",
+    "Traces back to a race where you held them off lap after lap.",
+  ],
+  rivalLeading: [
+    "Began after a first-lap collision neither of you has quite let go of.",
+    "Started the weekend they out-drove you in front of your home crowd.",
+    "It began when they took a win you were convinced should've been yours.",
+  ],
+  even: [
+    "Neither of you remembers who started it — you just keep racing each other close.",
+    "Began as a title fight that's never really ended.",
+    "Started as a simple midfield scrap that turned into something more personal.",
+  ],
+};
+function rollRivalryOrigin(headToHead){
+  const h2h = headToHead || {wins:0, losses:0};
+  const category = h2h.wins > h2h.losses ? 'playerLeading' : h2h.losses > h2h.wins ? 'rivalLeading' : 'even';
+  return pick(RIVALRY_ORIGINS[category]);
 }
 
 const REPUTATION_ARCHETYPES = [
@@ -893,6 +938,32 @@ const SPONSOR_POOL = [
   {name:'Zenith Capital', type:'Investment Bank', trait:'Only backs proven winners', pay:1.8, tier:3, unlockText:'Unlocks after your first career win'},
   {name:'Meridian Aerospace', type:'Aerospace & Defense', trait:'A championship-caliber prestige partner', pay:2.2, tier:4, unlockText:'Unlocks after 5 career podiums'},
 ];
+
+/* Sponsor type-flavored goal-completion lines (see REMAINING BACKLOG --
+   sponsor "type" previously drove objective SELECTION only, with zero
+   type-specific dialogue anywhere). Picked by sponsor.type in
+   checkSponsorObjectives() (app_actions.js) the moment a goal completes,
+   replacing the generic "Sponsor goal complete" toast with something that
+   actually sounds like that brand talking. Falls back to the generic line
+   for any type not listed here (there isn't one currently, but this keeps
+   adding a new SPONSOR_POOL entry safe without also requiring a dialogue
+   entry). */
+const SPONSOR_GOAL_LINES = {
+  'Luxury Brand': ["Exactly the composure we sponsor a driver for.", "Professional, polished, on-brand — well done."],
+  'Tech Company': ["That's the kind of forward progress we like to see.", "Innovation on track, results in the data — good work."],
+  'Energy Drink': ["THAT'S what we're paying for. Send us the onboard footage!", "Bold, fearless, exactly our brand. Keep pushing."],
+  'Eco Brand': ["Clean and efficient — precisely the image we want out there.", "Smart, sustainable racing. This is why we signed you."],
+  'Watchmaker': ["Precision, race after race. That's the Chronova standard.", "Consistency like that is worth more to us than any single win."],
+  'Airline': ["Great visibility for us this weekend — the global audience noticed.", "That's the kind of exposure that keeps our routes full."],
+  'Automotive Group': ["That's a proper professional performance. We're proud to have you.", "Real racecraft — this is exactly the partnership we wanted."],
+  'Streaming Platform': ["Our subscribers are going wild for this. More like that, please!", "That's must-watch racing right there. Great for the numbers."],
+  'Investment Bank': ["A calculated result. Exactly the kind of return we invest for.", "That's the performance we underwrote you for."],
+  'Aerospace & Defense': ["Championship-caliber work. This is what a prestige partnership looks like.", "Precision and results — the standard we expect from our drivers."],
+};
+function sponsorGoalLine(sponsorType){
+  const bank = SPONSOR_GOAL_LINES[sponsorType];
+  return bank ? pick(bank) : null;
+}
 
 /* p.traits/p.reputationArchetypes were previously read only for a display
    badge (Career Stats screen) -- this is the first real mechanical hook for
@@ -1115,10 +1186,40 @@ const QUIZ_QUESTIONS = [
   // -- mental / career --
   {id:'q_mental_1', theme:'mental', q:'High stress right before a race weekend tends to...', options:['Improve focus automatically','Quietly hurt performance if left unmanaged','Have no effect at all','Only matter in the rain'], correct:1},
   {id:'q_mental_2', theme:'mental', q:'Free Time activities mainly help by...', options:['Directly increasing car speed','Restoring energy and managing mood/stress','Signing new sponsors','Aging your driver faster'], correct:1},
+  // -- track-specific: each keyed to a real TRACKS entry (character/
+  // overtakeDiff/rainChance/sprintEligible) so it can never surface at the
+  // wrong circuit -- see pickQuizQuestions()'s trackId filter below. These
+  // supplement the general pool above rather than replacing it; a themed
+  // quiz at any given track mixes whichever general questions fit that
+  // theme with the 1-2 questions written specifically for that track.
+  {id:'q_track_monaco_1', theme:'strategy', trackId:'monaco', q:'Monaco is famous for being one of the hardest circuits to...', options:['Qualify well at','Overtake on','Find sponsors for','Get wet weather at'], correct:1},
+  {id:'q_track_silverstone_1', theme:'setup', trackId:'silverstone', q:'Silverstone\'s character as "Fast Flowing Corners" usually rewards...', options:['Maximum downforce and low top speed','A car that carries speed smoothly through corners','Pure straight-line speed only','Ignoring tire wear entirely'], correct:1},
+  {id:'q_track_monza', theme:'setup', trackId:'monza', q:'Monza\'s nickname "Temple of Speed" reflects a track that wants...', options:['Maximum downforce','Minimum downforce for top speed','A very short gear ratio','Wet-weather focus'], correct:1},
+  {id:'q_track_suzuka', theme:'setup', trackId:'suzuka', q:'Suzuka\'s figure-eight layout is considered...', options:['One of the easiest tracks to learn','A technically demanding circuit for setup and driving','A pure oval','Impossible to overtake on'], correct:1},
+  {id:'q_track_spa', theme:'tires', trackId:'spa', q:'Spa-Francorchamps is known for its elevation changes and...', options:['Guaranteed dry weather every race','Unpredictable, changeable weather','No sprint weekends ever','Extremely low overtaking difficulty'], correct:1},
+  {id:'q_track_interlagos', theme:'strategy', trackId:'interlagos', q:'Interlagos runs anti-clockwise, which is...', options:['The same as every other circuit','A layout quirk drivers have to adapt to','Only relevant in qualifying','Only relevant for sprint weekends'], correct:1},
+  {id:'q_track_cota', theme:'setup', trackId:'cota', q:'Circuit of the Americas is often described as a modern "rollercoaster" due to its...', options:['Flat, featureless layout','Significant elevation changes','Total lack of corners','Permanent wet conditions'], correct:1},
+  {id:'q_track_marina', theme:'strategy', trackId:'marina', q:'Marina Bay\'s tight street layout means overtaking is generally...', options:['Very easy','Very difficult — qualifying position matters a lot','Impossible even with a faster car','Only hard in the rain'], correct:1},
+  {id:'q_track_catalunya', theme:'setup', trackId:'catalunya', q:'Circuit de Catalunya is often used as an "aero test track" because it has...', options:['No corners at all','A wide mix of corner types that reward all-round aero balance','Only high-speed straights','Only tight hairpins'], correct:1},
+  {id:'q_track_redbullring', theme:'setup', trackId:'redbullring', q:'The Red Bull Ring\'s "Short & Punchy" character means lap times there are usually...', options:['Very long, over 100 seconds','Short, with quick direction changes','Impossible to predict','Only relevant in the wet'], correct:1},
+  {id:'q_track_zandvoort', theme:'setup', trackId:'zandvoort', q:'Zandvoort\'s banked, old-school corners are unusual because they...', options:['Are completely flat like most modern tracks','Let cars carry more speed through the corner itself','Only exist in Sprint Qualifying','Remove the need for a setup at all'], correct:1},
+  {id:'q_track_jeddah', theme:'setup', trackId:'jeddah', q:'Jeddah Corniche is a fast street circuit, which is a somewhat unusual combination because...', options:['Street circuits are normally low-speed and tight','All street circuits are identical in character','It never rains on street circuits','Street circuits never have setup differences'], correct:0},
+  {id:'q_track_imola', theme:'rules', trackId:'imola', q:'Imola\'s "Old-School & Narrow" character mainly makes it...', options:['One of the widest, easiest tracks to pass on','A tight, demanding layout where mistakes are costly','A pure high-speed oval','A circuit with no elevation at all'], correct:1},
+  {id:'q_track_hockenheim', theme:'setup', trackId:'hockenheim', q:'Hockenheimring\'s "Stadium Section Classic" layout is known for...', options:['A tight, enclosed final stadium section fans can see most of','Being entirely flat with no distinct sections','Having no corners at all','Only ever running in the wet'], correct:0},
+  {id:'q_track_losangeles', theme:'strategy', trackId:'losangeles', q:'As a brand-new street circuit, Los Angeles Street tends to reward...', options:['Ignoring qualifying position entirely','Strong qualifying, since street circuits are usually hard to pass on','Only wet-weather specialists','Skipping practice sessions'], correct:1},
+  {id:'q_track_kyalami', theme:'setup', trackId:'kyalami', q:'Kyalami\'s "High-Altitude Return" character mainly affects...', options:['Nothing — altitude has no effect on racing','How the car and engine perform in thinner air','Only the color of the track surface','Only qualifying, never the race'], correct:1},
+  {id:'q_track_portimao', theme:'setup', trackId:'portimao', q:'Portimão\'s "Rolling Elevation Changes" mean drivers have to deal with...', options:['A perfectly flat circuit throughout','Blind crests and changes in visibility through the lap','No corners of any kind','Permanent standing water'], correct:1},
+  {id:'q_track_seoul', theme:'strategy', trackId:'seoul', q:'Seoul Street Circuit, run at night, shares Marina Bay\'s trait of being...', options:['Extremely easy to overtake on','A tight street layout where grid position matters a lot','A circuit with no sprint weekends ever','Only run in daylight'], correct:1},
 ];
 
-function pickQuizQuestions(theme, count, recentlySeenIds){
-  const pool = QUIZ_QUESTIONS.filter(q => q.theme===theme || theme==='any');
+function pickQuizQuestions(theme, count, recentlySeenIds, trackId){
+  const themePool = QUIZ_QUESTIONS.filter(q => q.theme===theme || theme==='any');
+  // Track-specific questions (q.trackId set) only ever enter the pool when
+  // trackId is passed AND matches -- otherwise they're excluded entirely,
+  // so a Monaco-specific question can never surface at Monza. General
+  // questions (no trackId) are always eligible regardless, giving a mix
+  // rather than an all-track-trivia quiz.
+  const pool = themePool.filter(q => !q.trackId || q.trackId===trackId);
   const fresh = pool.filter(q => !(recentlySeenIds||[]).includes(q.id));
   const source = fresh.length >= count ? fresh : pool; // fall back to full pool if we've exhausted fresh ones
   const shuffled = [...source].sort(()=>Math.random()-0.5);
@@ -1269,7 +1370,7 @@ function createPlayer(config){
     reputationArchetypes:[], drivingStyle:null, styleProgress:{},
     contract:{ teamId:config.teamId, years:1, salary:1 }, money:5, homeLevel:1,
     careerStats:{ starts:0, wins:0, podiums:0, poles:0, fastestLaps:0, dnfs:0, points:0, wetWins:0 },
-    trackFamiliarity:{}, relationships:{}, sponsors:[], sponsorHistory:[], milestones:[], journal:[],
+    trackFamiliarity:{}, sponsors:[], sponsorHistory:[], milestones:[], journal:[],
     seasonAwardsWon:[], retired:false, difficulty: config.difficulty || 'Standard',
     setupTrainingByTrack:{}, trainingActionsThisWeek:0, trainingWeekTracker:undefined, unlockedSponsorTiers:[1],
     protege: null, // {name, nationality, flag, mentorProgress:0-100, graduated:false} -- see makeProtege()/mentorProtege() below. homeLevel>=3 required to recruit one (19.8's first real mechanical hook for homeLevel).
@@ -1463,7 +1564,15 @@ function driverStrength(driver, team, track, weather, moraleBonus, setupBonus, c
   // smaller than confidence/stress since mood is a softer, more diffuse state
   // than acute confidence or stress swings.
   pace += (l.mood-70)*0.045;
-  if(weather==='rain'){ pace += (d.wetSkill-50)*0.35; }
+  if(weather==='rain'){
+    pace += (d.wetSkill-50)*0.35;
+    // Rain Master (REPUTATION_ARCHETYPES, data.js -- wetSkill>=85): previously
+    // a display-only badge. A driver who's truly mastered wet conditions
+    // gets a little more out of that mastery than the base wetSkill
+    // weighting alone gives everyone -- small (+2 pace-equivalent), and
+    // gated to rain only so it never touches a dry-weather race.
+    if((driver.reputationArchetypes||[]).includes('rainmaster')) pace += 2;
+  }
   if(trackTemp!==undefined){
     const band = tempBand(trackTemp);
     // Hot track = tyres wear faster, so tyreManagement matters more (good
@@ -1573,7 +1682,21 @@ function simulateQualifying(grid, playerDriver, track, weather, playerPaceBonus,
       if(band.gripMult<1) score -= (1-band.gripMult) * 30; // cold track, less grip on a single hot lap
     }
     if(drv.id==='player' && playerPaceBonus) score += playerPaceBonus*1.4;
-    score += rand(-5,5);
+    // Qualifying Specialist (REPUTATION_ARCHETYPES, data.js -- qualifyingPace>=88):
+    // previously a display-only badge. A driver who's genuinely mastered
+    // single-lap pace gets a small direct bonus on top of qualifyingPace's
+    // own existing weight, rewarding a real, hard-earned stat threshold
+    // rather than double-counting the same number the formula already uses.
+    if((drv.reputationArchetypes||[]).includes('qualyspec')) score += 3;
+    // Ice King (REPUTATION_ARCHETYPES, data.js -- focus>=85 && confidence>=70):
+    // previously a display-only badge. Composure under the pressure of a
+    // single hot lap shrinks their share of qualifying's own variance term
+    // a little, rather than raising their score outright -- the archetype
+    // is about NOT cracking under pressure, so a tighter spread fits better
+    // than a flat bonus (same "shrink variance, don't add a flat number"
+    // shape as Defending's own effect in simulateRace).
+    const iceKingShrink = (drv.reputationArchetypes||[]).includes('iceking') ? 0.7 : 1;
+    score += rand(-5,5) * iceKingShrink;
     return { driverId: drv.id, score };
   });
   results.sort((a,b)=>b.score-a.score);
@@ -1613,7 +1736,22 @@ function simulateRace(grid, playerDriver, qualyResults, track, weather, playerSt
     // regardless of skill, matching real F1). At 99 overtaking on an
     // overtakeDiff 5 track, roughly a third of the penalty is clawed back.
     const overtakeRelief = 1 - (drv.attributes.driving.overtaking/99) * (1 - track.overtakeDiff/10) * 0.6;
-    const startPenalty = q.position * (track.overtakeDiff*0.35) * overtakeRelief;
+    let startPenalty = q.position * (track.overtakeDiff*0.35) * overtakeRelief;
+    // Overtake Artist (REPUTATION_ARCHETYPES, data.js -- overtaking>=85):
+    // previously a display-only badge. A driver who's genuinely mastered
+    // overtaking claws back a little more of the same grid-position
+    // penalty overtakeRelief already softens -- small (an extra ~8% off
+    // startPenalty), and still zero-effect on Monaco-style circuits since
+    // it multiplies the SAME startPenalty term overtakeRelief already
+    // zeroes out there.
+    if((drv.reputationArchetypes||[]).includes('overtakeartist')) startPenalty *= 0.92;
+    // Bad Starter (TRAIT_POOL negative, data.js): a driver whose qualifying
+    // pace has been consistently outrun by their race pace -- someone who
+    // races better than they start. Mechanically this nudges the same
+    // startPenalty term above a little harder, so a poor grid slot costs
+    // them slightly more than it would anyone else, matching the flavor of
+    // "struggles off the line" rather than just being a cosmetic label.
+    if((drv.traits||[]).includes('Bad Starter')) startPenalty *= 1.12;
     let raceScore = strength*10 - startPenalty;
     // Discipline: a disciplined driver pushes the car less erratically,
     // trimming a little off their own mechanical failure chance on top of
@@ -1628,6 +1766,24 @@ function simulateRace(grid, playerDriver, qualyResults, track, weather, playerSt
     // a rattled driver is a little more error-prone, not just unlucky.
     if((drv.traits||[]).includes('Ice Cold')) disciplineRelief *= 0.92;
     if((drv.traits||[]).includes('Hot Head')) disciplineRelief *= 1.08;
+    // Lucky / Fragile (TRAIT_POOL, data.js): the same discipline-adjacent
+    // slot as Ice Cold/Hot Head above, but earned by RESULTS (a run of
+    // races finished against the odds, or a run of DNFs despite decent
+    // discipline) rather than by a mental stat -- see checkTraitEvolution()
+    // for the exact trigger. Deliberately smaller than Ice Cold/Hot Head's
+    // swing so it reads as "a bit of luck either way" rather than a bigger
+    // mechanical effect than the stat-driven traits above it.
+    if((drv.traits||[]).includes('Lucky')) disciplineRelief *= 0.95;
+    if((drv.traits||[]).includes('Fragile')) disciplineRelief *= 1.06;
+    // veteran archetype (REPUTATION_ARCHETYPES, data.js -- age>=30 &&
+    // starts>=60): previously a display-only badge, DISTINCT from the
+    // separate Composed Veteran TRAIT (age>=28 && starts>=60, TRAIT_POOL)
+    // which already affects contract-clause odds. A driver with this many
+    // real seasons behind them makes fewer costly mechanical mistakes,
+    // same discipline-adjacent slot as Ice Cold/Lucky above but its own
+    // distinct, smaller trigger and effect so the two systems don't just
+    // duplicate each other under different names.
+    if((drv.reputationArchetypes||[]).includes('veteran')) disciplineRelief *= 0.96;
     const baseReliability = team.reliability*10 + (drv.id==='player' ? diff.reliabilityBonus : 0);
     // A hot track wears equipment faster (higher failChance); a cold one is
     // gentler on the car. saveTires strategy still helps on top of this.
@@ -1642,6 +1798,15 @@ function simulateRace(grid, playerDriver, qualyResults, track, weather, playerSt
     // covers general mechanical failure, not tyre wear. Small (-10%) and
     // capped so it never fully cancels heat/compound risk.
     if((drv.reputationArchetypes||[]).includes('tyrewhisperer')) tireWearMult *= 0.9;
+    // Driving Style (previously 100% cosmetic -- earned via recordStyleProgress()
+    // in engine.js after 5+ uses of the matching approach, shown only as a
+    // display chip). Tyre Saver style now trims a little more off tire wear
+    // specifically when actually playing to that identity (saveTires
+    // approach) -- the SAME slot Tyre Whisperer uses above, so the two
+    // stack rather than compete. Aggressive/Defensive get their matching
+    // pace-variance hook further down, right where push/attack/defend's own
+    // approach bonus already lives, rather than duplicating logic here.
+    if(drv.id==='player' && drv.drivingStyle==='Tyre Saver' && playerStrategy && playerStrategy.approach==='saveTires') tireWearMult *= 0.93;
     // Reliability gap from 100 is raised to a difficulty-scaled exponent
     // (>1 at Realistic, <1 at Casual) before scaling -- this widens the risk
     // gap between a strong car (safely near-0% regardless of difficulty) and
@@ -1658,13 +1823,38 @@ function simulateRace(grid, playerDriver, qualyResults, track, weather, playerSt
     // This is the sim's one variance term now, replacing the old flat
     // rand(-8,8) that used to apply equally regardless of skill.
     const defenseShrink = 1 - (drv.attributes.driving.defending/99)*0.3;
-    raceScore += rand(-8,8) * defenseShrink;
+    // Overconfident (TRAIT_POOL negative, data.js): earned by a driver whose
+    // confidence has outpaced their actual recent results (see
+    // checkTraitEvolution()). Widens their own share of the race's random
+    // variance a little on top of whatever defenseShrink above already
+    // gives them -- an overconfident driver is a bit more erratic race to
+    // race, not uniformly worse, so this affects spread rather than adding
+    // a flat penalty.
+    const overconfidentWiden = (drv.traits||[]).includes('Overconfident') ? 1.15 : 1;
+    // Wonderkid (REPUTATION_ARCHETYPES, data.js -- age<=21 && podiums>=2):
+    // previously a display-only badge. A young breakout talent who's
+    // already proven themselves handles race-day pressure better than
+    // their limited experience alone would suggest -- same "shrink your
+    // own share of variance" shape as defenseShrink/Ice King above, not a
+    // flat pace bonus, so the archetype reads as composure beyond their
+    // years rather than just being faster.
+    const wonderkidShrink = (drv.reputationArchetypes||[]).includes('wonderkid') ? 0.88 : 1;
+    raceScore += rand(-8,8) * defenseShrink * overconfidentWiden * wonderkidShrink;
     if(drv.id==='player' && playerStrategy){
       const tireMult = drv.id==='player' ? diff.tireForgiveness : 1;
       if(playerStrategy.approach==='push') raceScore += rand(-4,10);
       if(playerStrategy.approach==='saveTires') raceScore += rand(2,6)*tireMult;
       if(playerStrategy.approach==='defend') raceScore += rand(0,4);
       if(playerStrategy.approach==='attack') raceScore += rand(-6,14);
+      // Driving Style (continued from tireWearMult above): Aggressive style
+      // adds a small extra bonus specifically on push/attack -- the same
+      // approaches that earned the style in the first place -- and
+      // Defensive does the same for defend. Zero effect on any other
+      // approach or for a driver who hasn't earned a style yet, so this
+      // never touches AI drivers (drv.id==='player' gate above already
+      // covers that) or a player still building toward their first style.
+      if(drv.drivingStyle==='Aggressive' && (playerStrategy.approach==='push' || playerStrategy.approach==='attack')) raceScore += rand(1,4);
+      if(drv.drivingStyle==='Defensive' && playerStrategy.approach==='defend') raceScore += rand(1,4);
       // Tire compound pace effect -- applied on top of the approach's own
       // effect, same additive shape, zero effect at 'medium' (the default).
       raceScore += rand(compound.paceBonus[0], compound.paceBonus[1]);
@@ -1673,6 +1863,37 @@ function simulateRace(grid, playerDriver, qualyResults, track, weather, playerSt
   });
   raceScores.sort((a,b)=>b.raceScore-a.raceScore);
   return raceScores.map((r,i)=>({...r, position: r.dnf? null : i+1, finishOrder:i+1}));
+}
+
+/* Fastest lap: picks one non-DNF finisher per race, weighted by racePace +
+   consistency (the same two stats simulateRace's own pace formula leans on
+   most heavily -- see the `pace` line in driverStrength above), plus a small
+   bonus for finishing further up the order (leaders push harder on a clean
+   track, backmarkers are more likely lapped/blocked). Deliberately NOT just
+   "whoever's raceScore was highest" -- that would make fastest lap a near-
+   duplicate of the win, when in reality it's semi-independent (strategy,
+   fuel load, and traffic all move it around race to race). Called once per
+   race, right after simulateRace(), rather than folded into simulateRace
+   itself, so it stays a separate additive feature with its own call site
+   and doesn't change simulateRace's existing tested output shape at all. */
+function rollFastestLap(results, allDrivers){
+  const byId = Object.fromEntries(allDrivers.map(d=>[d.id,d]));
+  const finishers = results.filter(r=>!r.dnf);
+  if(!finishers.length) return null;
+  const weighted = finishers.map(r=>{
+    const drv = byId[r.driverId];
+    const d = drv.attributes.driving;
+    const paceWeight = d.racePace*0.6 + d.consistency*0.4;
+    const positionBonus = Math.max(0, 15 - r.position); // leaders get a modest boost, not a lock
+    return { driverId: r.driverId, weight: Math.max(1, paceWeight + positionBonus) };
+  });
+  const totalWeight = weighted.reduce((sum,w)=>sum+w.weight, 0);
+  let roll = Math.random() * totalWeight;
+  for(const w of weighted){
+    roll -= w.weight;
+    if(roll<=0) return w.driverId;
+  }
+  return weighted[weighted.length-1].driverId;
 }
 
 const DIFFICULTY_SETTINGS = {
@@ -1790,6 +2011,49 @@ function developTeamsForNewSeason(state, difficultySettings){
     pushStateNews(state, `🏗️ Off-season development complete. ${topTeam.flag} ${topTeam.name} enters the new season with the strongest car on the grid.`);
   }
 }
+
+/* ---------- AI grid driver skill drift (anti-overpower dynamic rivals) ----------
+   Previously every AI grid driver's skill attributes were rolled ONCE at
+   creation (createDriverAttributes(), called from makeRivalDriver() above)
+   and never touched again except the one-off mentoring bonus for a
+   graduated protégé -- meaning whoever happened to roll high stayed on top
+   of the standings indefinitely, and the points leader used for
+   enforcePlayerSkillCap() (app_core.js) never meaningfully changed identity
+   over a career. This gives every surviving AI driver a small, age-biased
+   season-over-season drift: young drivers (under ~26) trend up toward
+   their prime, drivers past ~30 trend down as they age out, and the
+   in-between years are a small, roughly neutral random walk -- the same
+   "bounded randomness, no player skill required" shape as
+   developTeamsForNewSeason's own car-strength drift above, just applied to
+   individual driver skill instead of team performance. Called from
+   handleSeasonEnd() (app_screens.js) right after the age++ loop, BEFORE
+   processGridRetirements() runs, so a driver's final season already
+   reflects their age-appropriate trajectory. Legend drivers (isLegend) are
+   exempt -- they're meant to represent a retired player at a fixed,
+   already-earned skill level, not keep developing. */
+function developGridDriversForNewSeason(state){
+  state.grid.forEach(driver=>{
+    if(driver.isLegend) return;
+    const age = driver.age||25;
+    // Peak years roughly 26-30 (matches retirementChanceForAge's own curve
+    // starting to bite at 34+): younger drivers trend up toward it, older
+    // drivers trend down away from it, prime-age drivers get a small
+    // roughly-neutral wobble either way.
+    let bias;
+    if(age < 24) bias = 1.2;
+    else if(age < 26) bias = 0.6;
+    else if(age <= 30) bias = 0;
+    else if(age <= 34) bias = -0.6;
+    else bias = -1.4;
+    ['driving','mental'].forEach(group=>{
+      Object.keys(driver.attributes[group]).forEach(stat=>{
+        const delta = bias + rand(-1.5, 1.5);
+        driver.attributes[group][stat] = clamp(Math.round(driver.attributes[group][stat] + delta), 20, 99);
+      });
+    });
+  });
+}
+
 function getDifficultySettings(state){
   return DIFFICULTY_SETTINGS[state.player.difficulty] || DIFFICULTY_SETTINGS.Standard;
 }
@@ -2008,8 +2272,20 @@ function processStaffTurnover(state, retireeCountThisSeason){
   state.careerRetirementCount = (state.careerRetirementCount||0) + retireeCountThisSeason;
   const priorMilestone = Math.floor(((state.careerRetirementCount - retireeCountThisSeason)) / 10);
   const newMilestone = Math.floor(state.careerRetirementCount / 10);
-  if(newMilestone > priorMilestone){
-    const tpIdx = state.npcRoster.findIndex(n=>n.role==='Team Principal');
+  // Team Principal respect (previously write-only -- "Discuss season
+  // expectations" moved it, nothing read it back): a Team Principal you've
+  // built real respect with is a little more secure in the job even when
+  // the milestone hits (small chance they survive it); one you've shown
+  // little respect can go early, before the milestone, on a small
+  // independent roll. Kept low-probability and separate from the milestone
+  // logic itself so the 10-retirement cadence is still the main driver of
+  // Team Principal turnover -- respect nudges timing, doesn't replace it.
+  const tpIdx = state.npcRoster ? state.npcRoster.findIndex(n=>n.role==='Team Principal') : -1;
+  const tpRespect = tpIdx>=0 ? (state.npcRoster[tpIdx].relationship.respect||50) : 50;
+  const milestoneHit = newMilestone > priorMilestone;
+  const survivesOnRespect = milestoneHit && tpRespect>=75 && Math.random()<0.4;
+  const earlyDepartureOnDisrespect = !milestoneHit && tpRespect<25 && Math.random()<0.03;
+  if((milestoneHit && !survivesOnRespect) || earlyDepartureOnDisrespect){
     if(tpIdx >= 0){
       const oldName = state.npcRoster[tpIdx].name;
       const gender = pick(['M','F']);
@@ -2099,16 +2375,34 @@ function checkScoutingInterest(state){
 }
 
 /* ---------- Save / Load ---------- */
-const SAVE_KEY = 'apexpal_save_v1';
+// Renamed from the pre-rename 'apexpal_save_v1' to match the shipped game
+// name. OLD_SAVE_KEY is read once by loadGame() as a migration fallback --
+// if a player's browser still only has data under the old key (any save
+// made before this rename), it's copied over to the new key and returned
+// normally, so no existing save is lost. New saves are always written
+// under SAVE_KEY only; the old key is never written to again.
+const SAVE_KEY = 'formulaonedirection_save_v1';
+const OLD_SAVE_KEY = 'apexpal_save_v1';
 function saveGame(state){
   try{ localStorage.setItem(SAVE_KEY, JSON.stringify(state)); return true; }
   catch(e){ console.error('Save failed', e); return false; }
 }
 function loadGame(){
-  try{ const raw = localStorage.getItem(SAVE_KEY); return raw ? JSON.parse(raw) : null; }
+  try{
+    const raw = localStorage.getItem(SAVE_KEY);
+    if(raw) return JSON.parse(raw);
+    // Migration fallback: an old save under the pre-rename key, never yet
+    // moved over. Copy it forward once so it isn't stranded.
+    const oldRaw = localStorage.getItem(OLD_SAVE_KEY);
+    if(oldRaw){
+      localStorage.setItem(SAVE_KEY, oldRaw);
+      return JSON.parse(oldRaw);
+    }
+    return null;
+  }
   catch(e){ console.error('Load failed', e); return null; }
 }
-function deleteSave(){ localStorage.removeItem(SAVE_KEY); }
+function deleteSave(){ localStorage.removeItem(SAVE_KEY); localStorage.removeItem(OLD_SAVE_KEY); }
 
 /* ---------- Legacy storage (survives deleteSave, one pending record) ----------
    Written when a retiring player picks a legacy perk; consumed the next time
@@ -2384,7 +2678,7 @@ const App = {
         </select>
 
         <label class="field-label">Difficulty</label>
-        <div class="section-sub" style="margin:0 0 8px;">Changes which starting teams are available below, plus tire wear, reliability, AI strength, and car-setup tolerance in every race.</div>
+        <div class="section-sub" style="margin:0 0 8px;">Affects starting teams, tire wear, AI strength, and setup tolerance.</div>
         <div class="option-grid" id="grid-diff" style="margin-bottom:18px;">
           ${['Casual','Standard','Realistic'].map(d=>`<div class="option-card ${cfg.difficulty===d?'selected':''}" data-val="${d}">${d}</div>`).join('')}
         </div>
@@ -2555,8 +2849,72 @@ const App = {
 
   saveState(){
     if(!this.state) return;
+    this.enforcePlayerSkillCap();
     this.syncTeamsToState();
     saveGame(this.state);
+  },
+
+  /* ---------------- SKILL CAP (anti-overpower) ----------------
+     Every driving/mental stat-changing action in the game (training,
+     dialogue effects, race-day feedback, mentoring) routes through
+     saveState() before persisting -- see ARCHITECTURE in the handoff doc.
+     Rather than threading a cap through 20+ scattered write sites (every
+     `p.attributes.X.Y = clamp(...)` call across app_actions.js/app_race.js),
+     this enforces the cap ONCE, centrally, right here, so no future stat
+     effect can silently bypass it by forgetting to call a helper.
+
+     The cap itself: each of the player's driving/mental stats is capped at
+     the CURRENT grid leader's same stat + SKILL_CAP_MARGIN. "Leader" means
+     the AI driver on top of the points standings -- re-evaluated every
+     single call, so the cap tracks whoever is actually leading right now,
+     not a fixed reference driver. If the player themselves is the points
+     leader, the cap instead uses the best AI driver's stat (the grid's
+     runner-up by points), so leading the championship doesn't remove the
+     ceiling entirely -- it just means the player is competing against the
+     next-best AI driver instead of themselves.
+
+     Deliberately per-stat (not "average" or "overall rating"): a leader
+     who's elite at braking but mediocre at wet skill produces a cap that's
+     high on braking and low on wet skill for the player too, so the cap
+     reflects a real competitive ceiling stat-by-stat rather than a single
+     flattened number. Lifestyle stats (fitness/mood/stress/energy) are
+     deliberately NOT capped here -- they're not competitive "skill" in the
+     same sense and already have their own bounded ranges. */
+  enforcePlayerSkillCap(){
+    const s = this.state; const p = s.player;
+    if(!p || !s.grid || !s.grid.length) return;
+    const SKILL_CAP_MARGIN = 8;
+    const sortedByPoints = [...s.grid].sort((a,b)=>(s.standings?.[b.id]||0)-(s.standings?.[a.id]||0));
+    const playerPoints = s.standings?.['player']||0;
+    const aiLeaderPoints = s.standings?.[sortedByPoints[0]?.id]||0;
+    // If the player is actually ahead of every AI driver on points, the
+    // "leader" for cap purposes is the best AI driver instead (still
+    // sortedByPoints[0] -- there's no separate driver to fall back to,
+    // the grid's own #1 AI driver IS the right reference either way).
+    const referenceDriver = sortedByPoints[0];
+    if(!referenceDriver) return;
+    ['driving','mental'].forEach(group=>{
+      Object.keys(p.attributes[group]).forEach(stat=>{
+        const cap = (referenceDriver.attributes[group][stat]||0) + SKILL_CAP_MARGIN;
+        if(p.attributes[group][stat] > cap) p.attributes[group][stat] = cap;
+      });
+    });
+  },
+
+  /* Read-only check used by the Training modal to flag a stat that's
+     already at (or within 2 of) its skill-cap ceiling, BEFORE the player
+     spends energy/money on a session that can't meaningfully move it.
+     Mirrors enforcePlayerSkillCap()'s exact reference-driver logic so the
+     two never drift out of sync with each other. */
+  isNearSkillCap(group, stat){
+    const s = this.state; const p = s.player;
+    if(!p || !s.grid || !s.grid.length) return false;
+    const SKILL_CAP_MARGIN = 8;
+    const sortedByPoints = [...s.grid].sort((a,b)=>(s.standings?.[b.id]||0)-(s.standings?.[a.id]||0));
+    const referenceDriver = sortedByPoints[0];
+    if(!referenceDriver) return false;
+    const cap = (referenceDriver.attributes[group][stat]||0) + SKILL_CAP_MARGIN;
+    return p.attributes[group][stat] >= cap - 2;
   },
 
   /* ---------------- TEAMS persistence ----------------
@@ -2598,7 +2956,20 @@ const App = {
 
   adjustTeamMorale(teamId, delta){
     if(!this.state.teamMorale) this.state.teamMorale = Object.fromEntries(TEAMS.map(t=>[t.id, 65]));
-    this.state.teamMorale[teamId] = clamp((this.state.teamMorale[teamId]||65) + delta, 0, 100);
+    // Team culture (data.js TEAMS[].culture, e.g. "Emotional, fast, high
+    // pressure" vs "Traditional, patient, loyal") was previously flavor
+    // text only -- displayed on the Team & Car screen, never touching
+    // morale mechanics despite reading like it should. TEAMS[].devTrend.
+    // volatility is the numeric value that same culture text is actually
+    // describing (it already drives how wildly a team's car development
+    // swings season to season) -- reusing it here for morale swings too
+    // means a "high pressure"/"volatile" team's morale genuinely swings
+    // harder on the same events a "patient, loyal" team shrugs off, without
+    // inventing a second parallel culture field to keep in sync.
+    const team = TEAMS.find(t=>t.id===teamId);
+    const volatility = (team && team.devTrend && team.devTrend.volatility) || 1.5;
+    const cultureMult = clamp(volatility/1.5, 0.7, 1.5); // 1.5 is the roster's rough average volatility
+    this.state.teamMorale[teamId] = clamp((this.state.teamMorale[teamId]||65) + delta*cultureMult, 0, 100);
   },
   getTeamMorale(teamId){
     if(!this.state.teamMorale) this.state.teamMorale = Object.fromEntries(TEAMS.map(t=>[t.id, 65]));
@@ -2799,6 +3170,9 @@ Object.assign(App, {
       {id:'starts', label:'Start Practice', icon:'🚦', cost:12, moneyCost:0.25, stat:'starts', group:'driving', facility:'simulator'},
       {id:'consistency', label:'Race Craft Drills', icon:'🎯', cost:16, moneyCost:0.4, stat:'consistency', group:'driving', facility:'simulator'},
       {id:'mental', label:'Mental Coaching', icon:'🧠', cost:10, moneyCost:0.2, stat:'focus', group:'mental', facility:'media'},
+      {id:'fuel_saving', label:'Fuel Management Drills', icon:'⛽', cost:14, moneyCost:0.35, stat:'fuelSaving', group:'driving', facility:'simulator'},
+      {id:'discipline', label:'Race Discipline Review', icon:'📋', cost:12, moneyCost:0.3, stat:'discipline', group:'mental', facility:'media'},
+      {id:'leadership', label:'Leadership Workshop', icon:'🤝', cost:12, moneyCost:0.3, stat:'leadership', group:'mental', facility:'media'},
     ];
     this.openModal(`
       ${this.modalHeader('Training')}
@@ -2809,9 +3183,15 @@ Object.assign(App, {
         ${PROGRAMS.map(tp=>{
           const price = this.trainingMoneyCost(tp);
           const canAfford = p.attributes.lifestyle.energy>=tp.cost && p.money>=price && !capReached;
+          // Skill cap (anti-overpower): show a driver when this stat is
+          // already at or very near the leader-relative ceiling
+          // (enforcePlayerSkillCap(), app_core.js) so a session that can't
+          // meaningfully help is visible BEFORE spending money on it,
+          // rather than only finding out from the toast afterward.
+          const nearCap = tp.group!=='lifestyle' && this.isNearSkillCap(tp.group, tp.stat);
           return `
           <button class="pbtn full" data-train="${tp.id}" style="justify-content:flex-start; text-align:left;" ${canAfford?'':'disabled'}>
-            ${tp.icon} ${tp.label} <span style="margin-left:auto; font-size:8px; color:var(--ink-soft);">-${tp.cost} nrg · -$${price.toFixed(1)}M</span>
+            ${tp.icon} ${tp.label} <span style="margin-left:auto; font-size:8px; color:${nearCap?'#e6604c':'var(--ink-soft)'};">${nearCap?'near cap · ':''}-${tp.cost} nrg · -$${price.toFixed(1)}M</span>
           </button>
         `;}).join('')}
       </div>
@@ -2870,8 +3250,13 @@ Object.assign(App, {
         p.setupTrainingByTrack[round.trackId] = (p.setupTrainingByTrack[round.trackId]||0) + 1;
       }
     }
-    this.toast(`${tp.icon} ${tp.label} complete! +${gain} (-$${price.toFixed(1)}M) · Training this week: ${p.trainingActionsThisWeek}/${WEEKLY_TRAINING_CAP}`);
-    this.saveState();
+    this.saveState(); // enforcePlayerSkillCap() runs inside here -- check the REAL post-cap value before toasting
+    const actualGain = target[tp.stat] - before;
+    if(actualGain < gain && tp.group!=='lifestyle'){
+      this.toast(`${tp.icon} ${tp.label} complete! +${actualGain} (-$${price.toFixed(1)}M) — capped near the grid leader's level. Training this week: ${p.trainingActionsThisWeek}/${WEEKLY_TRAINING_CAP}`);
+    } else {
+      this.toast(`${tp.icon} ${tp.label} complete! +${gain} (-$${price.toFixed(1)}M) · Training this week: ${p.trainingActionsThisWeek}/${WEEKLY_TRAINING_CAP}`);
+    }
     this.rerenderCurrentScreen();
     // First-time explainer (19.11 pattern, extended per the stats-legibility
     // pass): the very first training result is the natural moment a player
@@ -2883,7 +3268,7 @@ Object.assign(App, {
     // already moved on to something else.
     if(!p.seenStatEffectExplainer){
       this.showFirstTimeExplainer('seenStatEffectExplainer', '📊', 'What Stats Actually Do',
-        'Some stats (like Race Pace or Confidence) directly affect how fast you go. Others are narrower than they look — Adaptability, for example, only matters on cold tracks. A few are still cosmetic. Check "What Do My Stats Do?" in the Help modal (bottom of Home) any time you want the full breakdown.',
+        'Some stats directly boost your speed, like Race Pace. Others are narrower — Adaptability only helps on cold tracks. A few are just cosmetic. Full breakdown: "What Do My Stats Do?" in Help.',
         ()=>{});
     } else {
       this.closeModal();
@@ -2912,9 +3297,12 @@ Object.assign(App, {
         p.journal.unshift({season:s.season, week:s.week, title:'New Protégé', text:`Took on ${p.protege.name} as a protégé to mentor.`, icon:'🌟'});
         this.closeModal();
         this.saveState();
-        this.rerenderCurrentScreen();
+        this.showFirstTimeExplainer('seenMentorExplainer', '🎓', 'Mentoring a Protégé',
+          "Run sessions here to build their progress toward 100. Fully mentored, they wait for a real seat to open up, then graduate onto the grid as an AI driver.",
+          ()=> this.rerenderCurrentScreen());
       };
       return;
+
     }
     const pr = p.protege;
     if(pr.graduated){
@@ -3120,6 +3508,7 @@ Object.assign(App, {
         <div style="font-size:13px; font-weight:800;">${d.flag} ${team.flag} ${team.name}</div>
         <div class="section-sub" style="margin:4px 0 0;">Age ${d.age} · ${d.drivingStyle}${isDating?' · 💞 Dating you':''}</div>
         <div class="chip ${d.rivalryLevel>=50?'red':'gold'}" style="margin-top:8px;">${rivalryLabel}</div>
+        ${d.rivalryOrigin ? `<div class="section-sub" style="margin-top:8px; font-style:italic;">${d.rivalryOrigin}</div>` : ''}
       </div>
 
       <div class="section-title" style="margin-top:14px; font-size:10px;">Head-to-Head (this career)</div>
@@ -3305,40 +3694,56 @@ Object.assign(App, {
     });
   },
 
+  /* NPC personality (Calm/Energetic/Strict/Funny) was previously only read
+     for the Race Engineer's radio lines -- every other role's personality
+     was assigned at creation and displayed, but never changed a single
+     word of dialogue. This gives each role's two byRole result lines a
+     personality-flavored variant, same "small real effect, not a rewrite"
+     scope as every other trait/archetype hook fixed so far -- the
+     underlying effects (stat/relationship changes) are untouched, only the
+     response text now reflects who's actually saying it. */
+  npcFlavorLine(personality, calmLine, energeticLine, strictLine, funnyLine){
+    if(personality==='Energetic') return energeticLine;
+    if(personality==='Strict') return strictLine;
+    if(personality==='Funny') return funnyLine;
+    return calmLine;
+  },
+
   getTalkLinesForRole(n){
     const p = this.state.player;
+    const flavor = (calmLine, energeticLine, strictLine, funnyLine)=> this.npcFlavorLine(n.personality, calmLine, energeticLine, strictLine, funnyLine);
     const generic = [
       {label:'Chat casually', effect:()=>{ n.relationship.friendship = clamp(n.relationship.friendship+5); }, result:'Friendship improves.', memory:'Had a casual chat'},
       {label:'Share good news', effect:()=>{ n.relationship.affection = clamp(n.relationship.affection+4); p.attributes.lifestyle.mood = clamp(p.attributes.lifestyle.mood+3); }, result:'Mood improves for both of you.', memory:'Shared good news'},
     ];
     const byRole = {
       'Team Principal': [
-        {label:'Discuss season expectations', effect:()=>{ n.relationship.respect=clamp(n.relationship.respect+4); p.attributes.mental.pressure=clamp(p.attributes.mental.pressure+2); }, result:'A serious, useful conversation.', memory:'Discussed season expectations'},
-        {label:'Ask about the car budget', effect:()=>{ n.relationship.trust=clamp(n.relationship.trust+3); }, result:`${n.name} appreciates you taking an interest.`, memory:'Asked about the budget'},
+        {label:'Discuss season expectations', effect:()=>{ n.relationship.respect=clamp(n.relationship.respect+4); p.attributes.mental.pressure=clamp(p.attributes.mental.pressure+2); }, result:flavor('A serious, useful conversation.','A fired-up pep talk about the season ahead!','A clipped, businesslike rundown of expectations.','A season pep talk with more jokes than plans, somehow.'), memory:'Discussed season expectations'},
+        {label:'Ask about the car budget', effect:()=>{ n.relationship.trust=clamp(n.relationship.trust+3); }, result:flavor(`${n.name} appreciates you taking an interest.`,`${n.name} lights up talking numbers and ambition.`,`${n.name} runs through the figures with precise detail.`,`${n.name} jokes about the budget before actually answering.`), memory:'Asked about the budget'},
       ],
       'Chief Engineer': [
         {label:'Ask what to develop next', effect:()=>{ n.relationship.trust=clamp(n.relationship.trust+4); }, result:this.suggestNextDevelopment(), memory:'Asked what to develop next'},
-        {label:'Ask for a technical briefing', effect:()=>{ p.attributes.mental.focus=clamp(p.attributes.mental.focus+2); }, result:'A useful technical briefing. Focus +2.', memory:'Got a technical briefing'},
+        {label:'Ask for a technical briefing', effect:()=>{ p.attributes.mental.focus=clamp(p.attributes.mental.focus+2); }, result:flavor('A useful technical briefing. Focus +2.','An enthusiastic, fast-talking briefing. Focus +2.','A precise, no-nonsense briefing. Focus +2.','A briefing full of engineering puns. Focus +2.'), memory:'Got a technical briefing'},
       ],
       'Race Engineer': [
         {label:'Review the last race radio calls', effect:()=>{ n.relationship.friendship=clamp(n.relationship.friendship+4); p.attributes.driving.consistency=clamp(p.attributes.driving.consistency+1); }, result:'A helpful debrief. Consistency +1.', memory:'Reviewed race radio calls'},
         {label:'Build trust before the next race', effect:()=>{ n.relationship.trust=clamp(n.relationship.trust+5); }, result:'Trust builds ahead of the weekend.', memory:'Built trust before the race'},
       ],
       'Doctor': [
-        {label:'Get a fitness check-up', effect:()=>{ p.attributes.lifestyle.fitness=clamp(p.attributes.lifestyle.fitness+3); }, result:'A clean bill of health. Fitness +3.', memory:'Had a fitness check-up'},
-        {label:'Talk about managing stress', effect:()=>{ p.attributes.lifestyle.stress=clamp(p.attributes.lifestyle.stress-8); }, result:'Some helpful advice. Stress -8.', memory:'Talked about managing stress'},
+        {label:'Get a fitness check-up', effect:()=>{ p.attributes.lifestyle.fitness=clamp(p.attributes.lifestyle.fitness+3); }, result:flavor('A clean bill of health. Fitness +3.','An energetic, encouraging check-up. Fitness +3.','A thorough, by-the-book check-up. Fitness +3.','A check-up with too many bad puns. Fitness +3.'), memory:'Had a fitness check-up'},
+        {label:'Talk about managing stress', effect:()=>{ p.attributes.lifestyle.stress=clamp(p.attributes.lifestyle.stress-8); }, result:flavor('Some helpful advice. Stress -8.','An upbeat pep talk about handling pressure. Stress -8.','A structured stress-management plan. Stress -8.','Advice delivered with a joke that actually helps. Stress -8.'), memory:'Talked about managing stress'},
       ],
       'Journalist': [
-        {label:'Off-the-record chat', effect:()=>{ n.relationship.trust=clamp(n.relationship.trust+5); }, result:'A relaxed, honest conversation.', memory:'Had an off-the-record chat'},
-        {label:'Ask what the paddock is saying', effect:()=>{ n.relationship.friendship=clamp(n.relationship.friendship+3); }, result:`${n.name} shares some paddock gossip with you.`, memory:'Asked about paddock gossip'},
+        {label:'Off-the-record chat', effect:()=>{ n.relationship.trust=clamp(n.relationship.trust+5); }, result:flavor('A relaxed, honest conversation.','A lively, animated conversation.','A careful, precisely-worded exchange.','A conversation that turns into a bit of a roast.'), memory:'Had an off-the-record chat'},
+        {label:'Ask what the paddock is saying', effect:()=>{ n.relationship.friendship=clamp(n.relationship.friendship+3); }, result:flavor(`${n.name} shares some paddock gossip with you.`,`${n.name} excitedly spills all the paddock gossip.`,`${n.name} gives a measured, factual paddock rundown.`,`${n.name} shares gossip with way too much commentary.`), memory:'Asked about paddock gossip'},
       ],
       'Best Friend': [
-        {label:'Grab a meal together', effect:()=>{ p.attributes.lifestyle.mood=clamp(p.attributes.lifestyle.mood+8); n.relationship.affection=clamp(n.relationship.affection+6); }, result:'A great catch-up. Mood +8.', memory:'Grabbed a meal together'},
-        {label:'Vent about the season', effect:()=>{ p.attributes.lifestyle.stress=clamp(p.attributes.lifestyle.stress-10); n.relationship.friendship=clamp(n.relationship.friendship+5); }, result:'It feels good to talk it out. Stress -10.', memory:'Vented about the season'},
+        {label:'Grab a meal together', effect:()=>{ p.attributes.lifestyle.mood=clamp(p.attributes.lifestyle.mood+8); n.relationship.affection=clamp(n.relationship.affection+6); }, result:flavor('A great catch-up. Mood +8.','A loud, laughter-filled catch-up. Mood +8.','A calm, focused catch-up. Mood +8.','A catch-up that\'s basically a comedy show. Mood +8.'), memory:'Grabbed a meal together'},
+        {label:'Vent about the season', effect:()=>{ p.attributes.lifestyle.stress=clamp(p.attributes.lifestyle.stress-10); n.relationship.friendship=clamp(n.relationship.friendship+5); }, result:flavor('It feels good to talk it out. Stress -10.','They hype you right back up. Stress -10.','They listen and give you a clear-headed take. Stress -10.','They turn your bad week into a bit. Stress -10.'), memory:'Vented about the season'},
       ],
       'Streamer Pal': [
         {label:'Co-stream together', effect:()=>{ p.fanPopularity=clamp(p.fanPopularity+5,0,999); n.relationship.friendship=clamp(n.relationship.friendship+4); }, result:'Fans loved the crossover! Popularity +5.', memory:'Co-streamed together'},
-        {label:'Trade gaming tips', effect:()=>{ p.attributes.lifestyle.mood=clamp(p.attributes.lifestyle.mood+5); }, result:'A fun, relaxed hangout.', memory:'Traded gaming tips'},
+        {label:'Trade gaming tips', effect:()=>{ p.attributes.lifestyle.mood=clamp(p.attributes.lifestyle.mood+5); }, result:flavor('A fun, relaxed hangout.','A hyped, chaotic hangout.','A surprisingly methodical strategy session.','A hangout that\'s 90% inside jokes.'), memory:'Traded gaming tips'},
       ],
     };
     return [...(byRole[n.role]||[]), ...generic, ...this.getRomanceLinesFor(n)];
@@ -3457,7 +3862,7 @@ Object.assign(App, {
     this.closeModal();
     this.saveState();
     this.rerenderCurrentScreen();
-    if(metSomeone) this.showFirstTimeExplainer('seenRomanceExplainer', '💕', 'New Faces', "You've caught the eye of a few different people tonight, each with their own personality type and compatibility. Pick one to pursue — the others simply won't be chosen, no drama needed.", ()=> this.renderRomanceCandidatesModal());
+    if(metSomeone) this.showFirstTimeExplainer('seenRomanceExplainer', '💕', 'New Faces', "You've caught a few eyes tonight. Pick one to pursue — no drama with the rest.", ()=> this.renderRomanceCandidatesModal());
   },
 
   /* Presents the 3 rolled candidates side by side (name, type, bio,
@@ -3760,10 +4165,13 @@ Object.assign(App, {
         p.journal.unshift({season:s.season, week:s.week, title:'New Sponsor', text:`Signed a deal with ${sp.name} (${sp.type}).`, icon:'🤝'});
         this.closeModal();
         this.saveState();
-        this.rerenderCurrentScreen();
+        this.showFirstTimeExplainer('seenSponsorExplainer', '🤝', 'How Sponsor Deals Work',
+          "Each sponsor gives you a goal — hit it for a payout and a new one. Hit 10 goals and they become a Permanent partner. Sponsors stay with you even if you switch teams.",
+          ()=> this.rerenderCurrentScreen());
       };
     });
   },
+
 
   /* Sponsor goals now repeat: each sponsor tracks a running goalsCompleted
      count (0-10). Every time the CURRENT goal is met, goalsCompleted+1 and a
@@ -3831,6 +4239,7 @@ Object.assign(App, {
         sp.lastGoalSeason = s.season; sp.lastGoalWeek = s.week; // for "(last goal: Year N, Week W)" display in the Sponsors modal
         const bonus = Math.round(sp.pay*2*loyaltyMult*10)/10;
         p.money = Math.round((p.money+bonus)*10)/10;
+        const flavorLine = sponsorGoalLine(sp.type);
         if(sp.goalsCompleted >= 10){
           sp.permanent = true;
           this.toast(`🌟 ${sp.name} is now a permanent partner! Bonus pay locked in every race.`);
@@ -3839,6 +4248,7 @@ Object.assign(App, {
         } else {
           this.toast(`🎯 Sponsor goal complete (${sp.goalsCompleted}/10)! ${sp.name} pays a $${bonus}M bonus.`);
           this.pushNews(`🎯 ${p.name} completes a bonus goal for ${sp.name} (${sp.goalsCompleted}/10 toward a permanent deal).`);
+          if(flavorLine) p.journal.unshift({season:s.season, week:s.week, title:`${sp.name} Check-In`, text:`"${flavorLine}"`, icon:'🎯'});
         }
       }
     });
@@ -4217,7 +4627,7 @@ Object.assign(App, {
     if(nav==='home') this.renderHub();
     else if(nav==='race') this.renderRaceCenterScreen();
     else if(nav==='training') this.openActionModal('training');
-    else if(nav==='team') this.showFirstTimeExplainer('seenDevSlotsExplainer', '🔧', 'Car Development', "Every season your team gets a limited number of development slots — spend them wisely on upgrades. Higher Engineering facility levels grant more slots per season, and slots reset fresh each new season.", ()=> this.renderTeamScreen());
+    else if(nav==='team') this.showFirstTimeExplainer('seenDevSlotsExplainer', '🔧', 'Car Development', "Each season you get a limited number of dev slots — spend them on upgrades wisely. Higher Engineering facility levels mean more slots, and they reset fresh every new season.", ()=> this.renderTeamScreen());
     else if(nav==='social') this.renderRelationshipsModal();
     else if(nav==='career') this.renderCareerStatsModal();
   },
@@ -4249,7 +4659,7 @@ Object.assign(App, {
     checkScoutingInterest(s);
     this.saveState();
     this.renderHub();
-    if(celebRolled) this.showFirstTimeExplainer('seenCelebrityExplainer', '🌟', 'Celebrity Encounter', "As your fame grows, you'll sometimes cross paths with celebrities. How you handle these moments affects your fan popularity and carries a small risk of a tabloid rumor.", ()=> this.renderCelebrityEncounterModal(celebRolled));
+    if(celebRolled) this.showFirstTimeExplainer('seenCelebrityExplainer', '🌟', 'Celebrity Encounter', "As fame grows, you'll cross paths with celebrities. Handle it well and fan popularity goes up, though there's a small chance of a tabloid rumor too.", ()=> this.renderCelebrityEncounterModal(celebRolled));
   },
 
   /* Returns the rolled celebrity object if an encounter fires this day,
@@ -4522,6 +4932,7 @@ Object.assign(App, {
       subtitle: `${track.name} — Free Practice${round.weather==='rain' ? ' (Wet)' : ''}`,
       theme,
       questionCount: 3,
+      trackId: track.id,
       onComplete: (scorePct)=>{
         // Familiarity gain: a base amount everyone gets for showing up, plus
         // a bonus for a strong mini-game showing — so practice always helps
@@ -4553,6 +4964,7 @@ Object.assign(App, {
       subtitle: `${track.name} — Qualifying${round.weather==='rain' ? ' (Wet)' : ''}`,
       theme,
       questionCount: 3,
+      trackId: track.id,
       onComplete: (scorePct)=> this.resolveQualifying(track, scorePct),
     });
   },
@@ -4665,10 +5077,10 @@ Object.assign(App, {
      state.player.recentQuizIds (a short rolling window) so players see
      variety over a career without ever fully running out of questions —
      the pool is reused, just not back-to-back. */
-  startQuizMiniGame({title, subtitle, theme, questionCount, onComplete}){
+  startQuizMiniGame({title, subtitle, theme, questionCount, trackId, onComplete}){
     const s = this.state; const p = s.player;
     if(!p.recentQuizIds) p.recentQuizIds = [];
-    const questions = pickQuizQuestions(theme, questionCount, p.recentQuizIds);
+    const questions = pickQuizQuestions(theme, questionCount, p.recentQuizIds, trackId);
     p.recentQuizIds = [...p.recentQuizIds, ...questions.map(q=>q.id)].slice(-14); // keep a rolling window
 
     this._quizState = { questions, index:0, correctCount:0, title, subtitle, onComplete };
@@ -4752,6 +5164,7 @@ Object.assign(App, {
       subtitle: `${track.name} — one quick lap sets the sprint grid`,
       theme: 'strategy',
       questionCount: 2,
+      trackId: track.id,
       onComplete: (scorePct)=> this.resolveSprintQualifying(track, round, scorePct),
     });
   },
@@ -4956,9 +5369,11 @@ Object.assign(App, {
       <div class="section-sub" style="margin-bottom:8px;">Conditions: <b>${conditionsChip}</b>${isRain ? ' — wet skill matters more.' : band.label==='Hot' ? ' — tyres wear faster, DNF risk up.' : band.label==='Cold' ? ' — less grip for everyone.' : ''}</div>
       ${modifiersHtml}
       <div class="section-sub" style="margin-bottom:6px;">Pick a tire compound.${band.label==='Hot' && !isRain ? ' Heat punishes Soft tires hardest today.' : ''}</div>
-      <div class="pbtn-row" style="margin-bottom:10px;">
+      <div class="pbtn-row" style="margin-bottom:4px;">
         ${compoundOptions.map(c=>`<button class="pbtn ${this._selectedCompound===c.id?'gold':''}" data-compound="${c.id}" style="flex:1; flex-direction:column; height:auto; padding:8px 4px;" title="${c.desc}">${c.icon}<br><span style="font-size:8px;">${c.label}</span></button>`).join('')}
       </div>
+      <div class="section-sub" style="margin-bottom:10px; font-size:8px;">${compoundOptions.find(c=>c.id===this._selectedCompound)?.desc || ''}</div>
+
       <div class="section-sub">Choose your approach for today's race.</div>
       <div class="stack-8">
         <button class="pbtn full" data-strat="push">🔥 Push — higher risk, higher reward</button>
@@ -5168,6 +5583,11 @@ Object.assign(App, {
     const results = simulateRace(s.grid, p, qualy, track, weather, {approach, compound: compound||'medium'}, getDifficultySettings(s), this.getTeamMorale(p.teamId), paceBonus, trackTemp);
     const safetyCarEvent = this.maybeApplySafetyCar(results, qualy);
     const weatherShiftEvent = this.maybeApplyWeatherShift(results, weather);
+    const fastestLapDriverId = rollFastestLap(results, [...s.grid, p]);
+    if(fastestLapDriverId){
+      const flDrv = fastestLapDriverId==='player' ? p : s.grid.find(d=>d.id===fastestLapDriverId);
+      if(flDrv) flDrv.careerStats.fastestLaps = (flDrv.careerStats.fastestLaps||0) + 1;
+    }
 
     const playerResult = results.find(r=>r.driverId==='player');
     const teammateEntry = s.grid.find(d=>d.teamId===p.teamId);
@@ -5204,6 +5624,10 @@ Object.assign(App, {
       if(pos===1){ fanGain+=150; moneyGain+=4; }
       else if(pos<=3){ fanGain+=60; moneyGain+=2; }
     } else { fanGain -= 15; }
+    // Fastest lap: small standalone bonus on top of the position-based one
+    // above, since real fastest laps pay out regardless of finishing spot.
+    const playerHasFastestLap = fastestLapDriverId==='player';
+    if(playerHasFastestLap){ moneyGain += 1; fanGain += 20; }
     p.money = Math.round((p.money + moneyGain)*10)/10;
     const cosmeticBonuses = this.getCosmeticBonuses();
     if(cosmeticBonuses.fanPopularity) fanGain += cosmeticBonuses.fanPopularity;
@@ -5239,7 +5663,14 @@ Object.assign(App, {
     // every single race regardless of result, on top of the result-based
     // swings above -- small (max +0.5 at 99 leadership), but this was
     // previously a mental stat with zero effect anywhere in the game.
-    const leadershipBoost = (p.attributes.mental.leadership/99) * 0.5;
+    let leadershipBoost = (p.attributes.mental.leadership/99) * 0.5;
+    // Leader (TRAIT_POOL positive, data.js): earned by sustained high
+    // leadership backed by real tenure at the current team (see
+    // checkTraitEvolution()) -- a senior figure in the garage, not just a
+    // high stat number. Scales the same leadership morale bump above
+    // rather than adding a separate mechanic, since the trait is really
+    // just "this driver's leadership has become a genuine team asset."
+    if(p.traits.includes('Leader')) leadershipBoost *= 1.4;
     if(leadershipBoost>0) this.adjustTeamMorale(p.teamId, leadershipBoost);
 
     const completedRoundIndex = s.calendar.currentRound; // capture BEFORE increment -- this is the round that just finished
@@ -5267,7 +5698,7 @@ Object.assign(App, {
     s.lastRaceHeadline = { track: track.name, position: pos, dnf: playerResult.dnf };
 
     const playerQualy = qualy.find(q=>q.driverId==='player');
-    this.openModal(this.renderRaceResultHtml(results, pos, playerResult.dnf, headline, moneyGain, fanGain, sponsorIncome, playerQualy, track, safetyCarEvent, weatherShiftEvent));
+    this.openModal(this.renderRaceResultHtml(results, pos, playerResult.dnf, headline, moneyGain, fanGain, sponsorIncome, playerQualy, track, safetyCarEvent, weatherShiftEvent, playerHasFastestLap));
     // No X close button here -- this MUST resolve via Continue. The X button
     // previously just removed the modal from the DOM (closeModal(), no
     // re-render) while round.completed/s.calendar.currentRound had ALREADY
@@ -5364,7 +5795,7 @@ Object.assign(App, {
     return {title:`QUIET WEEKEND FOR ${p.name.toUpperCase()}`, body:`A tough race leaves ${p.name} outside the points at ${track.name}.`};
   },
 
-  renderRaceResultHtml(results, pos, dnf, headline, moneyGain, fanGain, sponsorIncome, playerQualy, track, safetyCarEvent, weatherShiftEvent){
+  renderRaceResultHtml(results, pos, dnf, headline, moneyGain, fanGain, sponsorIncome, playerQualy, track, safetyCarEvent, weatherShiftEvent, playerHasFastestLap){
     const top10 = results.slice(0,10).map(r=>{
       const isPlayer = r.driverId==='player';
       const drv = isPlayer ? this.state.player : this.state.grid.find(d=>d.id===r.driverId);
@@ -5428,6 +5859,7 @@ Object.assign(App, {
       ${this.modalHeader('Race Result')}
       ${safetyCarEvent ? `<div class="chip red" style="margin-bottom:8px; display:block;">🚨 Safety Car — the field bunched up${safetyCarEvent.caughtOutDriverId==='player' ? ', and you were caught out by the chaos' : ''}.</div>` : ''}
       ${weatherShiftEvent ? `<div class="chip blue" style="margin-bottom:8px; display:block;">🌦️ Conditions shifted mid-race — ${weatherShiftEvent.playerWetSkill>weatherShiftEvent.fieldAvgWetSkill ? 'you adapted better than most.' : weatherShiftEvent.playerWetSkill<weatherShiftEvent.fieldAvgWetSkill ? 'the change caught you out a little.' : 'it evened out for everyone.'}</div>` : ''}
+      ${playerHasFastestLap ? `<div class="chip gold" style="margin-bottom:8px; display:block;">⏱️ Fastest Lap! +$1M, +20 fans.</div>` : ''}
       <div class="headline-card">
         <div class="kicker">RACE REPORT</div>
         <h3>${headline.title}</h3>
@@ -5458,7 +5890,15 @@ Object.assign(App, {
       if(id==='player') return;
       const drv = s.grid.find(d=>d.id===id);
       if(!drv) return;
-      drv.rivalryLevel = clamp((drv.rivalryLevel||0) + 6, 0, 100);
+      // Respect (previously write-only -- every rival/teammate dialogue
+      // choice moved it, nothing read it back): a mutually respectful
+      // relationship builds rivalry more slowly race to race -- healthy
+      // competition, not open hostility. Low respect does the opposite,
+      // letting the SAME on-track closeness escalate faster. Scaled around
+      // the 50 baseline so an untouched relationship (respect never moved)
+      // behaves exactly as before -- +6 at 50, ranging roughly +4..+8.
+      const respectMult = 1 - ((drv.respect||50)-50)/125; // 0 respect -> 1.4x, 100 respect -> 0.6x
+      drv.rivalryLevel = clamp((drv.rivalryLevel||0) + 6*respectMult, 0, 100);
       // Head-to-head record: who finished ahead this race, tracked per rival
       // so the Rival Profile can show a genuine "you lead 7-3" style record.
       if(!drv.headToHead) drv.headToHead = { wins:0, losses:0 };
@@ -5476,6 +5916,7 @@ Object.assign(App, {
     if(top && top.rivalryLevel>=20 && top.id!==prevRivalId){
       s.rivalId = top.id;
       if(top.id!==prevRivalId){
+        if(!top.rivalryOrigin) top.rivalryOrigin = rollRivalryOrigin(top.headToHead);
         this.toast(`⚔️ ${top.name} is becoming your rival!`);
         this.pushNews(`⚔️ A rivalry is forming: ${p.name} vs ${top.name}.`);
       }
@@ -5503,7 +5944,7 @@ Object.assign(App, {
   },
 
   checkTraitEvolution(){
-    const p = this.state.player;
+    const p = this.state.player; const s = this.state;
     if(p.careerStats.dnfs>=3 && !p.traits.includes('Nervous Under Pressure')){
       p.traits.push('Nervous Under Pressure');
     }
@@ -5534,10 +5975,57 @@ Object.assign(App, {
     // Hot Head: a boiling rivalry (rivalryLevel>=80, the top of the scale
     // fed by confrontational media/rival dialogue choices) paired with high
     // stress -- the negative-trait mirror of Ice Cold, earned by letting a
-    // rivalry get personal rather than staying composed under it.
+    // rivalry get personal rather than staying composed under it. Gated on
+    // respect staying low (<40): a fierce rivalry with real mutual respect
+    // reads as hard-fought competition, not a Hot Head -- the same rivalry
+    // intensity with respect already worn down by hostile choices is what
+    // actually earns the trait.
     const rival = this.getRival && this.getRival();
-    if(rival && (rival.rivalryLevel||0)>=80 && p.attributes.lifestyle.stress>=70 && !p.traits.includes('Hot Head')){
+    if(rival && (rival.rivalryLevel||0)>=80 && p.attributes.lifestyle.stress>=70 && (rival.respect||50)<40 && !p.traits.includes('Hot Head')){
       p.traits.push('Hot Head');
+    }
+    // Lucky: a real career sample (starts>=25) with a DNF rate well under
+    // what the player's own team reliability alone would predict -- reuses
+    // the exact same reliabilityGap shape simulateRace's own failChance
+    // formula is built on (engine.js), so "lucky" means genuinely
+    // outperforming your own car's odds, not just a low DNF count on a
+    // already-reliable car.
+    const team = this.getTeam ? this.getTeam(p.teamId) : null;
+    if(team && p.careerStats.starts>=25){
+      const dnfRate = p.careerStats.dnfs / p.careerStats.starts;
+      const expectedReliabilityGap = Math.max(0, 100 - team.reliability*10) / 1000; // same 0-1ish scale as failChance's own gap term
+      if(dnfRate < expectedReliabilityGap*0.5 && !p.traits.includes('Lucky')) p.traits.push('Lucky');
+      // Fragile: the mirror case -- a DNF rate notably worse than the same
+      // team-reliability prediction, despite a real sample size. Distinct
+      // from Nervous Under Pressure (raw DNF count) by being about RATE
+      // relative to the car's own odds, not an absolute count threshold.
+      if(dnfRate > expectedReliabilityGap*2 && !p.traits.includes('Fragile')) p.traits.push('Fragile');
+    }
+    // Leader: sustained high leadership stat AND real tenure at the current
+    // team (joinedTeamOnSeason, set in app_core.js/app_screens.js) -- a
+    // driver who's actually been around long enough to be a senior voice
+    // in the garage, not just someone with a high leadership number on day one.
+    const tenureSeasons = (s.season||0) - (p.joinedTeamOnSeason||s.season||0);
+    if(p.attributes.mental.leadership>=75 && tenureSeasons>=2 && !p.traits.includes('Leader')){
+      p.traits.push('Leader');
+    }
+    // Bad Starter: qualifying pace lagging well behind race pace over a
+    // real sample -- a driver who consistently races better than they
+    // start, mirroring Late Braker's own "stat backed by a real sample"
+    // shape above rather than a single snapshot comparison.
+    if(p.careerStats.starts>=20 && (p.attributes.driving.racePace - p.attributes.driving.qualifyingPace)>=18 && !p.traits.includes('Bad Starter')){
+      p.traits.push('Bad Starter');
+    }
+    // Overconfident: high self-belief that isn't backed up by points
+    // actually scored per start -- the trait fires when confidence has
+    // clearly outpaced real output, using only already-tracked fields
+    // (no new recency tracker) so it stays consistent with every other
+    // trigger here.
+    if(p.careerStats.starts>=20){
+      const pointsPerStart = p.careerStats.points / p.careerStats.starts;
+      if(p.attributes.mental.confidence>=80 && pointsPerStart<4 && !p.traits.includes('Overconfident')){
+        p.traits.push('Overconfident');
+      }
     }
   },
 
@@ -5559,6 +6047,14 @@ Object.assign(App, {
     if(p.careerStats.points>=100) fire('100_points', `${p.name} passes 100 career championship points.`);
     if(p.careerStats.points>=250) fire('250_points', `${p.name} passes 250 career championship points.`);
     if(p.careerStats.points>=500) fire('500_points', `${p.name} passes 500 career championship points.`);
+    // Fastest Laps and Wet Wins (careerStats.fastestLaps/wetWins) were
+    // tracked and shown in Career Stats but never fed a milestone -- same
+    // "tracked but write-only" gap as poles/wins had before their own
+    // milestones existed above. Same 5-count threshold as poles' own
+    // milestone, since fastest laps are earned at a similar rate (roughly
+    // one per race weighted by pace, same as pole position).
+    if((p.careerStats.fastestLaps||0)>=5) fire('5_fastest_laps', `${p.name} claims their 5th career fastest lap.`);
+    if((p.careerStats.wetWins||0)>=3) fire('3_wet_wins', `${p.name} wins their 3rd career race in the rain.`);
   },
 
 });
@@ -6131,7 +6627,7 @@ Object.assign(App, {
     const winPct = cs.starts>0 ? Math.round(cs.wins/cs.starts*100) : 0;
     const stats = [
       ['Starts',cs.starts],['Wins',cs.wins],['Podiums',cs.podiums],['Poles',cs.poles],
-      ['DNFs',cs.dnfs],['Wet Wins',cs.wetWins],['Points',cs.points],['Win Rate',winPct+'%'],
+      ['DNFs',cs.dnfs],['Wet Wins',cs.wetWins],['Fastest Laps',cs.fastestLaps||0],['Points',cs.points],['Win Rate',winPct+'%'],
     ];
     const rival = this.getRival ? this.getRival() : null;
     const archetypeNames = (p.reputationArchetypes||[]).map(id=>REPUTATION_ARCHETYPES.find(a=>a.id===id)).filter(Boolean);
@@ -6413,6 +6909,23 @@ Object.assign(App, {
 
     p.age++;
     s.grid.forEach(d=> d.age++);
+    developGridDriversForNewSeason(s);
+    // Player skill decay (anti-overpower): a small season-over-season fade
+    // on driving/mental stats, representing rust/aging the same way real
+    // drivers need to keep training to stay sharp rather than banking a
+    // stat forever once earned. Deliberately smaller than a single
+    // training session's typical gain (see doTraining(), app_actions.js --
+    // a base gain is ~2 before facility bonuses), so regular training more
+    // than offsets it; a season spent NOT training is where this actually
+    // bites. Runs before enforcePlayerSkillCap() gets its next chance to
+    // apply (every saveState() call), so decay and the leader-relative cap
+    // interact naturally rather than needing special-cased ordering.
+    const SEASON_SKILL_DECAY = 2;
+    ['driving','mental'].forEach(group=>{
+      Object.keys(p.attributes[group]).forEach(stat=>{
+        p.attributes[group][stat] = clamp(p.attributes[group][stat] - SEASON_SKILL_DECAY, 0, 99);
+      });
+    });
     const retirees = processGridRetirements(s);
     processStaffTurnover(s, retirees.length);
     p.contract.years = Math.max(0, p.contract.years - 1);
@@ -6473,6 +6986,7 @@ Object.assign(App, {
       ${clauseMissed ? `<div class="pixel-panel" style="border-left:3px solid var(--candy-red);"><div class="panel-title">⚠️ Contract Clause Missed</div><div class="section-sub" style="margin:0;">${clauseMissed} — your contract ends early, and renewal talks will reflect it.</div></div>` : ''}
       ${awards.length ? `<div class="pixel-panel"><div class="panel-title">Season Awards</div><div class="pbtn-row">${awards.map(a=>`<span class="chip gold">🏅 ${a}</span>`).join('')}</div></div>` : ''}
       ${completedObjectives.length ? `<div class="pixel-panel"><div class="panel-title">Objectives Completed</div>${completedObjectives.map(o=>`<div class="section-sub" style="margin:4px 0;">🎯 ${o.text} — +$${o.reward.money}M, +${o.reward.rep} reputation</div>`).join('')}</div>` : ''}
+      <div class="section-sub" style="margin:4px 0 10px;">🔧 A quiet offseason still costs a little sharpness — your stats have faded slightly. Keep training to stay ahead.</div>
       <button class="pbtn full gold" id="btn-next-season">Continue</button>
     `);
     // No close button here -- this modal MUST resolve to startNextSeason(),
@@ -6812,43 +7326,55 @@ const TUTORIAL_STEPS = [
     id:'welcome',
     icon:'🏎️',
     title:'Welcome to the Paddock!',
-    text:'This is your driver pod — tap it anytime to check in. Your career plays out day by day, race weekend by race weekend.',
+    text:'This is your driver pod. Tap it anytime to check in. Your career plays out day by day.',
   },
   {
     id:'condition',
     icon:'⚡',
     title:'Watch Your Condition',
-    text:'Energy, Mood, and Stress affect your performance. Training and racing cost energy — rest and Free Time activities recover it.',
+    text:'Energy, Mood, and Stress affect your performance. Training and racing cost energy. Rest and Free Time bring it back.',
   },
   {
     id:'week',
     icon:'📅',
     title:'This Week',
-    text:'Every week builds toward a race weekend. Friday is Practice, Saturday is Qualifying, Sunday is the Race. The rest of the week is yours to spend on Training, Sponsors, or Free Time.',
+    text:'Friday is Practice, Saturday is Qualifying, Sunday is the Race. Free days are yours — Training, Sponsors, or Free Time.',
   },
   {
     id:'actions',
     icon:'🎯',
     title:'Choose Your Day',
-    text:'Each free day, pick one activity: Training builds your skills, Free Time restores you, Socialize builds relationships, Media boosts your reputation, Sponsors bring in money, and Team & Car upgrades your machine.',
+    text:'Training builds skills. Free Time restores you. Socialize, Media, and Sponsors each grow a different part of your career.',
   },
   {
     id:'race',
     icon:'🏁',
     title:'Race Weekends',
-    text:'Dial in your car setup in Practice, post a fast lap in Qualifying, then choose a strategy and race! Your results earn points, money, and fans.',
+    text:'Dial in your setup in Practice. Post a fast lap in Qualifying. Pick a strategy and race!',
+  },
+  {
+    id:'tires',
+    icon:'🛞',
+    title:'Tires & Sprints',
+    text:'Soft tires are fast but wear out fast. Hard tires last longer, cost some pace. Sprint weekends add a Saturday race that sets Sunday\'s grid.',
+  },
+  {
+    id:'mentor',
+    icon:'🎓',
+    title:'Mentor a Protégé',
+    text:'Once your home is strong enough, Mentor appears as a daily activity. Train a protégé and they can graduate onto the grid.',
   },
   {
     id:'profile',
     icon:'🎨',
     title:'Make Your Mark',
-    text:'The little palette button on your pod opens your Driver Profile — helmets, liveries, suits, and gloves unlock as your career progresses, each with a small bonus while equipped.',
+    text:'Tap the palette on your pod for your Driver Profile. Helmets, liveries, suits, and gloves unlock as you go.',
   },
   {
     id:'rename',
     icon:'✏️',
     title:'Make It Yours',
-    text:'Tap any name with a pencil icon — yours, rivals, or your team staff — to rename them anytime.',
+    text:'Tap any name with a pencil icon to rename it — anytime.',
   },
 ];
 
@@ -6910,23 +7436,26 @@ Object.assign(App, {
 });
 
 const HELP_TOPICS = [
-  {icon:'⚡', title:'Energy, Mood & Stress', text:'Training and racing cost Energy. Low Mood or high Stress quietly hurt your race performance. Most Free Time activities restore some Energy alongside their other benefits — a Rest Day is the most reliable way to recover if you are running low.'},
-  {icon:'💪', title:'Training', text:'Every training program now costs both Energy and money, and prices rise slightly the better your relevant facility gets (though so do the gains). Sim: Tyre Management trains Tyre Management directly — useful since tyre wear matters a lot on hot tracks. Race Craft Drills trains Consistency.'},
-  {icon:'📊', title:'What Do My Stats Do?', text:'<b>Driving:</b> Race Pace, Cornering, Consistency, Tyre Management, and Braking are the core race-pace formula (in that order of importance). Qualifying Pace sets your single-lap speed. Wet Skill only matters in the rain. Overtaking claws back grid-position penalties where passing is possible. Defending steadies your race-day luck. Reaction sharpens qualifying and widens your formation-lap reaction window. Fuel Saving and Starts subtly nudge your ideal gear-ratio setup. <br><br><b>Mental:</b> Confidence and Focus both add directly to race pace (Confidence a bit more). Pressure helps in qualifying specifically. Discipline trims your own mechanical failure risk. Adaptability <i>only</i> softens the grip penalty on cold tracks — it does nothing on a normal-temperature circuit. Leadership gives the whole garage a tiny morale lift after a race. <br><br><b>Lifestyle:</b> Stress subtracts from race pace; Mood adds a smaller amount around its own neutral point; Fitness adds a small amount too. Energy is a pure resource — it gates whether you can train, mentor, or go out, and doesn\'t touch pace directly. <br><br><b>Reputation:</b> Fan Popularity unlocks celebrity encounters, sponsor goals, and the Fan Favorite trait. Media Reputation unlocks the Media Darling reputation, which — like Fan Favorite — opens tier-2 sponsors a little early. <br><br>Overtaking, Defending, Reaction, Discipline, Leadership, Fuel Saving, and Starts have no dedicated training program — they move only through milestones, traits, and story events, but every one of them is real and measurable.'},
-  {icon:'🏎️', title:'Practice, Qualifying, Race', text:'Practice builds track familiarity (helps your pace) and feeds your crew\'s setup hints. Qualifying sets your grid position — starting further back makes overtaking harder on tight circuits. Race strategy (Push/Attack/Defend/Save Tires) changes your risk and reward for that race only.'},
-  {icon:'🎛️', title:'Car Setup Hints', text:'Each track has its own ideal Downforce/Balance/Gear Ratio, nudged slightly by your own driving stats. Practice at a track and run Simulator training to build your crew\'s confidence — the hint band shown on the setup sliders narrows the more you know. Matching the ideal setup gives a small, real pace boost; missing it badly costs you a little, more so on Realistic.'},
-  {icon:'🔧', title:'Car & Facilities', text:'Car Development (Aero, Engine, Chassis, Suspension, Reliability) directly improves race pace and reduces mechanical failures — but it now costs limited seasonal development slots, not just money, so a higher Engineering facility level (more slots) matters as much as your budget. Facilities improve how efficiently you train, develop the car, spin press answers, and grow sponsor loyalty over time.'},
-  {icon:'🏗️', title:'Rival Team Development', text:'Every team on the grid — not just yours — develops their car over the off-season at their own pace and personality. Some climb steadily, some boom-or-bust, some quietly fade. Check the Grid Pecking Order on the Team & Car screen to see how the field is shifting year to year.'},
-  {icon:'📈', title:'Difficulty', text:'Casual gives more forgiving tyres, fewer mechanical failures, a wider setup tolerance, slower AI team development, easier sponsor goals, and every starting team unlocked. Standard locks the very top teams until you\'ve proven yourself; Realistic locks the top two tiers, sharpens the AI grid, and makes sponsor goals noticeably tougher — the championship fight gets harder in every direction.'},
-  {icon:'⚔️', title:'Rivals', text:'Racing closely against the same driver repeatedly builds a rivalry. Rivalries add extra flavor to headlines and season storylines.'},
-  {icon:'✨', title:'Driving Style', text:'Lean on the same race strategy repeatedly and you will develop a signature Driving Style, shown on your driver card.'},
-  {icon:'📝', title:'Contracts', text:'Contracts run out after a set number of seasons. When yours expires, you will be offered new deals — including a chance to move to a different team.'},
-  {icon:'🎨', title:'Driver Profile & Cosmetics', text:'Tap the palette icon on your pod to open your Driver Profile. New helmets, liveries, suits, and gloves unlock on a fixed schedule as your career progresses through seasons and race rounds — never randomly. Equipped cosmetics give small, permanent-while-equipped bonuses like extra Confidence or Fan Popularity.'},
-  {icon:'🌟', title:'Retirement & Legacy', text:'When you retire, you can choose one Legacy Perk to carry into your next career (extra starting money, fan fame, driving skill, or team contacts), and your retired driver joins the new grid as a legendary AI rival racing in their prime.'},
-  {icon:'👥', title:'Relationships', text:'Your Team Principal, engineers, doctor, journalist, and friends all have their own friendship meter. Talking to them regularly deepens the relationship.'},
-  {icon:'💘', title:'Romance', text:'Once you know someone well enough, a Flirt option appears when you Talk to them — build up a spark and it can turn into dating, with small mood and stress benefits. Going Out now surfaces a few distinct people to choose from, each with their own type (Adventurous, Grounded, Ambitious, Free Spirit, or Homebody) and a passive perk once you\'re dating them.'},
-  {icon:'🌟', title:'Celebrity Encounters', text:'Once your Fan Popularity is high enough, you may occasionally run into a famous face — a Common celebrity from 40+ Fan Popularity, Rare from 65+, Legendary from 85+. Leaning into the publicity gives a bigger Fan Popularity boost but risks a tabloid rumor (more stress); keeping it low-key is safer but smaller.'},
-  {icon:'🏆', title:'Career Journal & Museum', text:'Every milestone — your first podium, your first win, contract signings — is recorded automatically in your Journal and archived in the Hall of Fame Museum.'},
+  {icon:'⚡', title:'Energy, Mood & Stress', text:'Training and racing cost Energy. Low Mood or high Stress quietly hurt your race. Rest Day is the most reliable way to recover.'},
+  {icon:'💪', title:'Training', text:'Every program costs Energy and money. Better facilities mean pricier sessions — but bigger gains too. Sim: Tyre Management trains Tyre Management. Race Craft Drills trains Consistency.'},
+  {icon:'📊', title:'What Do My Stats Do?', text:'<b>Driving:</b> Race Pace, Cornering, Consistency, Tyre Management, and Braking are your core pace. Qualifying Pace sets single-lap speed. Wet Skill only matters in rain. Overtaking helps you pass. Defending steadies your race-day luck. <b>Mental:</b> Confidence and Focus both add to race pace. Pressure helps in qualifying. Discipline trims failure risk. Adaptability only helps on cold tracks. <b>Lifestyle:</b> Stress hurts pace, while Mood and Fitness help a little. Energy just gates what you can do — it doesn\'t touch pace directly. <b>Reputation:</b> Fan Popularity unlocks celebrities and sponsor goals, and Media Reputation opens tier-2 sponsors early.'},
+  {icon:'🎚️', title:'Skill Ceiling', text:'Your driving and mental stats are capped a little above whoever currently leads the championship — so a maxed-out build across the board isn\'t possible while someone else is ahead of you. The grid isn\'t static either: rival drivers drift up or down each season depending on age, so the leader (and the ceiling) genuinely shifts over a career. Your own stats also fade slightly at the end of each season, so ongoing training matters even once you\'re near the top.'},
+  {icon:'🏎️', title:'Practice, Qualifying, Race', text:'Practice builds track familiarity and setup hints. Qualifying sets your grid position. Before the race, pick a tire: Soft is fast but wears out, Hard lasts but costs pace. Strategy (Push/Attack/Defend/Save Tires) changes that race\'s risk and reward.'},
+  {icon:'🏃', title:'Sprint Weekends', text:'A few rounds each season add a Saturday Sprint. Sprint Qualifying sets the Sprint grid, and the Sprint result sets Sunday\'s starting grid too.'},
+  {icon:'🎛️', title:'Car Setup Hints', text:'Each track has an ideal Downforce/Balance/Gear Ratio. Practice and Simulator training narrow the hint band, and matching the ideal setup gives a small pace boost.'},
+  {icon:'🔧', title:'Car & Facilities', text:'Car Development boosts pace and cuts failures, but it costs limited seasonal dev slots, not just money — a higher Engineering facility means more slots. Facilities also speed up training, sponsors, and media.'},
+  {icon:'🏗️', title:'Rival Team Development', text:'Every team develops their car each off-season — some climb, some fade, some boom-or-bust. Check Grid Pecking Order on Team & Car to track it.'},
+  {icon:'📈', title:'Difficulty', text:'Casual gives forgiving tyres, easier goals, and every team unlocked. Standard locks the top teams until you\'ve proven yourself. Realistic locks the top two tiers and sharpens the AI and sponsors.'},
+  {icon:'⚔️', title:'Rivals', text:'Race closely against the same driver and a rivalry builds. Rivalries add flavor to headlines and storylines.'},
+  {icon:'✨', title:'Driving Style', text:'Lean on the same strategy repeatedly and you\'ll develop a signature Driving Style, shown on your driver card.'},
+  {icon:'📝', title:'Contracts', text:'Contracts run out after a set number of seasons. When yours expires, you\'ll get new offers — maybe from another team.'},
+  {icon:'🎨', title:'Driver Profile & Cosmetics', text:'Tap the palette icon on your pod for your Driver Profile. Helmets, liveries, suits, and gloves unlock on a fixed schedule, and equipped items give small permanent bonuses.'},
+  {icon:'🎓', title:'Mentor a Protégé', text:'Unlocks once your home hits facility level 3. Mentoring sessions build their progress toward 100, and once fully mentored, they graduate onto the grid at a real retirement.'},
+  {icon:'🌟', title:'Retirement & Legacy', text:'At retirement, pick one Legacy Perk for your next career. Your retired driver joins the new grid as a legend, racing in their prime.'},
+  {icon:'👥', title:'Relationships', text:'Your Team Principal, engineers, doctor, journalist, and friends each have a friendship meter. Talking to them regularly deepens it.'},
+  {icon:'💘', title:'Romance', text:'Know someone well enough and a Flirt option appears. Build a spark and it can turn into dating. Going Out surfaces a few people with different types and perks.'},
+  {icon:'🌟', title:'Celebrity Encounters', text:'High Fan Popularity means occasional celebrity run-ins. Leaning into publicity gives a bigger boost but more rumor risk, while staying low-key is safer but smaller.'},
+  {icon:'🏆', title:'Career Journal & Museum', text:'Every milestone is recorded automatically in your Journal, and archived in the Hall of Fame Museum too.'},
 ];
 
 </script>
