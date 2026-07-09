@@ -24,14 +24,18 @@ next session more time than writing an accurate one costs you now.
    cd /home/claude/apex && python3 rebuild.py
    node -e "const fs=require('fs');const h=fs.readFileSync('index.html','utf8');const m=h.match(/<script>([\s\S]*?)<\/script>\s*<script>/);fs.writeFileSync('extracted.js',m[1]);"
    node --check extracted.js && echo OK
-   for t in regression_test coverage_audit retirement_test suite_economy_test suite_progression_test suite_features_test; do
+   for t in regression_test coverage_audit retirement_test suite_economy_test suite_progression_test suite_features_test suite_features2_test suite_newfeatures_test suite_pass21_test; do
      timeout 120 node $t.js 2>&1 | tail -5
    done
    ```
    Confirm everything is clean BEFORE making changes, so any later failure is
    known to be yours, not a pre-existing issue. Current clean-baseline check
    counts: `suite_economy_test.js` 23, `suite_progression_test.js` 9,
-   `suite_features_test.js` 28 (plus the 3 structurally-separate scripts).
+   `suite_features_test.js` 20, `suite_features2_test.js` 8,
+   `suite_newfeatures_test.js` 14, `suite_pass21_test.js` 4 (plus the 3
+   structurally-separate scripts: regression_test, coverage_audit,
+   retirement_test). `suite_features_test.js` was split into two files in
+   Pass 22 — see TESTING WORKFLOW's gotcha note for why.
    **Re-count with `grep -c "await runCheck" suite_*.js` rather than trusting
    this number** — it drifts the moment someone adds a check without
    updating this doc.
@@ -129,7 +133,13 @@ repeatedly across sessions: the SAME full-suite run can show different
 checks failing each time with `Protocol error`/`detached Frame`/`Session
 closed`/`Execution context was destroyed`, and isolating a "failing" check
 into its own single-page script almost always shows it passing cleanly.
-Mitigations already in the test suite:
+**Pass 22 confirmed the root cause at the hardware level: this sandbox has
+exactly 1 CPU core (`nproc` → 1).** Headless Chrome is itself multi-process;
+a single core under sustained load (many `puppeteer.launch()` calls across
+a long session, or a heavy `page.evaluate()` computation loop right before
+a UI-interaction check) will predictably starve and disconnect. This is not
+fixable from test code alone — it's a property of the sandbox, not the
+suite. Mitigations already in the test suite:
 - Wrap long loops in try/catch, treat those four error strings as a sandbox
   crash (report separately, don't fail the whole test on it).
 - Keep any single playthrough's target modest (regression_test.js targets 5
@@ -138,6 +148,28 @@ Mitigations already in the test suite:
   which jumps `calendar.currentRound` to the season's last round instead of
   clicking through ~200 iterations) rather than raising the budget and hoping.
 - Launch with `args:['--no-sandbox','--disable-dev-shm-usage','--disable-gpu','--disable-extensions']`.
+- **(Pass 22)** If a single `suite_*.js` file consistently disconnects from
+  the SAME point onward across 3+ runs (not different points each time —
+  that's noise; the SAME point is a genuine overload trigger), split the
+  file into two `puppeteer.launch()` calls at that boundary rather than
+  chasing timing margins. `suite_features_test.js` (28 checks) was split
+  into `suite_features_test.js` (20) + `suite_features2_test.js` (8) this
+  way — the second half consistently disconnected right after a
+  1500-trial `page.evaluate()` computation, and splitting fixed it outright
+  where a stabilization delay alone did not.
+- **(Pass 22)** A cached Puppeteer `ElementHandle` (from `page.$()`) can
+  silently no-op on `.click()` if grabbed even slightly before use, even
+  though the element is genuinely present/clickable a moment later via a
+  FRESH lookup — confirmed via direct A/B testing (same click, same state,
+  only the handle's age differs). Prefer
+  `await page.evaluate(() => document.getElementById(id).click())` over a
+  cached handle for any click after a retry-poll or a preceding heavy
+  computation.
+- **(Pass 22)** Before a long testing session, clean up
+  `/tmp/.org.chromium.*` directories periodically (`rm -rf
+  /tmp/.org.chromium* 2>/dev/null`) — dozens of leftover profile dirs from
+  earlier `launchBrowser()` calls accumulate over a long session and can
+  compound the single-core contention above.
 
 **Gotcha — statistical checks need enough trials, and must exclude
 sentinel/outlier values from averages.** A DNF's `raceScore` is a `-9999`
@@ -157,38 +189,73 @@ has already moved on, breaking the NEXT iteration's element lookup instead of
 the one that triggered it. Fire these synchronously, in place of the plain
 `closeModal()`, only the first time.
 
-### Test suite (6 runnable scripts + 1 shared helper module)
+### Test suite (9 runnable scripts + 1 shared helper module)
 
 ```
 _test_helpers.js         NOT a test -- shared launch/robustClick/startNewCareer/
-                          runCheck/printSummaryAndExit helpers, required by the
-                          suite_*.js files below so they don't each repeat the
-                          same boilerplate.
+                          runCheck/printSummaryAndExit helpers. Required by every
+                          suite_*.js/regression_test.js/retirement_test.js/
+                          coverage_audit.js file. As of Pass 22, startNewCareer()
+                          also skips the junior series prologue (feature idea
+                          #12) and waits out maybeShowTutorial()'s own 400ms
+                          setTimeout before checking for the tutorial skip
+                          button -- a 300ms wait there was an intermittent
+                          race that left the tutorial modal open and silently
+                          blocking every subsequent click in a test.
 
 regression_test.js       full playthrough: new career, sponsor sign, race loop, zero console errors
 coverage_audit.js        4 viewports (360×640, 375×667, 390×844, 1440×900) × every screen/modal,
                           checks no overflow under #bottom-nav, no horizontal scroll, close button reachable
-retirement_test.js       force-age retirement flow → legacy perk → RETIRES screen
+retirement_test.js       force-age retirement flow → legacy perk → RETIRES screen → Legend Exhibition (Pass 22)
 
 suite_economy_test.js    23 checks -- car development, facility effects, training/setup-confidence
-                          pacing, performance-clause contracts, sponsor rework, difficulty knobs,
-                          stat/archetype wiring (mood, mediaReputation sponsor unlock, Tyre
-                          Whisperer DNF relief)
+                          pacing, performance-clause contracts, sponsor rework (Pass 22: 10-goal
+                          progression now QUEUES a renewal choice instead of auto-converting to
+                          permanent -- see feature idea #3), difficulty knobs, stat/archetype wiring
+                          (mood, mediaReputation sponsor unlock, Tyre Whisperer DNF relief)
 
 suite_progression_test.js 9 checks -- celebrity encounters, romance overhaul, multi-career Hall
                           of Fame, legacy-perk legend-driver carryover, difficulty-gated starting
-                          teams, mentor/protégé graduation, trait-evolution fixes (Ice Cold/Late
-                          Braker/Workhorse/Hot Head, plus a false-positive guard)
+                          teams, mentor/protégé graduation (Pass 22: now reads p.protegeRoster
+                          rather than assuming p.protege still points at the just-graduated
+                          prospect -- see feature idea #16's roster auto-advance), trait-evolution
+                          fixes (Ice Cold/Late Braker/Workhorse/Hot Head, plus a false-positive guard)
 
-suite_features_test.js   28 checks -- race-weekend depth features, the must-resolve-modal fixes,
-                          22-driver grid invariant, sprint weekend flow, stat-attributed radio
-                          lines, weather-shift events, "current pace modifiers" chip
+suite_features_test.js   20 checks -- race-weekend depth features, the must-resolve-modal fixes,
+                          22-driver grid invariant, sprint weekend flow, "current pace modifiers"
+                          chip. Split from a single 28-check file in Pass 22 (see TESTING WORKFLOW's
+                          gotcha note) -- checks 1-20 here, 21-28 in suite_features2_test.js.
+
+suite_features2_test.js  8 checks (Pass 22 split) -- safety car banner, formation-lap mini-moment,
+                          plausibleLapTime UI rendering, stat-attributed radio lines, weather-shift
+                          events, Q1/Q2/Q3 elimination framing. Kept in its own browser session
+                          specifically because this half consistently disconnected the shared
+                          session when combined with the first half's heavy trial loops.
+
+suite_newfeatures_test.js 14 checks (Pass 22) -- targeted checks for the highest-risk/most
+                          load-bearing of the 17 new features: junior series prologue (state-
+                          creation-order dependency, bounded stat adjustment), Team Ownership Mode
+                          (silent auto-resolve chain, season-wrap re-surfacing via a REAL
+                          coordinate-click test, modal-overlay correctly blocking a stale click),
+                          driver academy roster + grid invariant, contract release clause, sponsor
+                          renewal negotiation, multi-year roadmap milestones (met + missed paths),
+                          team orders detection/swap, weather microclimates fire-rate, sim racing
+                          side career + cross-over sponsor unlock, track records board.
+
+suite_pass21_test.js     4 checks (Pass 22) -- closes the Pass 21 "Not done" gap: quiz double-click
+                          re-entry (rapid double-click on the last question doesn't throw/corrupt
+                          state), protégé name uniqueness (400 trials, zero collisions), Constructors'
+                          Championship points staying with the team that earned them after a
+                          mid-season switch, rival-is-teammate dedupe in the multi-driver press
+                          conference (no doubled effects, no duplicated name). Kept in its own
+                          browser session (not folded into suite_features_test.js) per the same
+                          sustained-load reasoning as the suite_features2_test.js split.
 ```
 
-Run each with a `timeout` wrapper — 6 commands total instead of running every
+Run each with a `timeout` wrapper — 9 commands total instead of running every
 check file individually:
 ```bash
-for t in regression_test coverage_audit retirement_test suite_economy_test suite_progression_test suite_features_test; do
+for t in regression_test coverage_audit retirement_test suite_economy_test suite_progression_test suite_features_test suite_features2_test suite_newfeatures_test suite_pass21_test; do
   timeout 120 node $t.js 2>&1 | tail -5
 done
 ```
@@ -201,7 +268,10 @@ start a new `suite_*.js` if none fit), as one more `await runCheck(results,
 'name', async () => { ... return {pass, detail}; })` block — copy an
 existing block's shape (`newPage`/`startNewCareer`/assertions/`page.close()`/
 push to `allErrors`) rather than inventing a new pattern. **Update the check
-counts in this section when you do.**
+counts in this section when you do.** If the suite you're adding to already
+has 20+ checks or any heavy (1000+ trial) `page.evaluate()` loops, consider
+starting a new file instead of growing it further — see the sustained-load
+gotcha above.
 
 ---
 
@@ -331,6 +401,9 @@ save is lost — new saves are only ever written under the new key.
 Always call `this.saveState()` after mutating `App.state` (wraps the skill
 cap, `syncTeamsToState()`, and `saveGame()` — see "saveState() is the
 central choke point" above) — never call `saveGame()` directly.
+`LEGACY_KEY`/`HOF_KEY` got the same rename+migration treatment in Pass 19
+(see CHANGELOG) — `'formulaonedirection_legacy_v1'`/`'formulaonedirection_hof_v1'`,
+each falling back to their own pre-rename `apexpal_*` key once.
 
 ### Rebuild-safe editing
 Always `view` the exact current file section immediately before editing with
@@ -375,6 +448,16 @@ Re-derived directly from `createPlayer()`/`createDriverAttributes()`
       // a 5-count milestone. wetWins feeds a 3-count milestone. Both shown
       // in Career Stats (app_screens.js renderCareerStatsModal()).
     trackFamiliarity:{[trackId]:65-100},
+    mechanicalRiskMult: number|undefined,
+      // multi-weekend DNF consequence chain (Pass 19) -- transient field,
+      // same lifecycle shape as familiarityBonus (set before simulateRace,
+      // read inside it). 1.6 right after a mechanical DNF, decays 0.25/
+      // weekend, clearable to 1 via Team screen's "Address Reliability
+      // Concern" button. undefined/1 = no elevated risk.
+    isHomeTrackBonus: number|undefined,
+      // Home Tracks (Pass 19) -- transient field, set alongside
+      // familiarityBonus at qualifying/sprint-qualifying time when
+      // isHomeTrack() (engine.js) is true for that track.
     sponsors:[], sponsorHistory:[{name,season}], unlockedSponsorTiers:[1],
     milestones:[], journal:[{season,week,title,text,icon}],
     seasonAwardsWon:[{season,award}], retired:false,
@@ -382,18 +465,65 @@ Re-derived directly from `createPlayer()`/`createDriverAttributes()`
     setupTrainingByTrack:{[trackId]:number},  // per-track sim training count, feeds setupHintConfidence -- NOT global
     trainingActionsThisWeek:number, trainingWeekTracker:number|undefined,  // weekly training cap (3/week), tracker resets against s.week
     recentQuizIds:[ids],
-    protege: null|{name,nationality,flag,mentorProgress:0-100,graduated:boolean},
-      // recruit at homeLevel>=3; graduates ONLY into a real grid retirement
-      // slot via processGridRetirements(), never as an extra 23rd driver
+    protege: null|{name,nationality,flag,mentorProgress:0-100,graduated:boolean,_academyId},
+      // recruit at homeLevel>=3; the SINGLE actively-mentored prospect --
+      // see protegeRoster below for the Pass 22 academy roster this now
+      // sits alongside. Graduates ONLY into a real grid retirement slot via
+      // processGridRetirements(), never as an extra 23rd driver.
+    protegeRoster: [ /* up to ACADEMY_MAX_SIZE=3 protege-shaped objects */ ],
+      // Driver Academy (Pass 22, feature idea #16) -- deepens the mentor
+      // system rather than replacing it. p.protege is always one member of
+      // this array (or null). Non-active members still accrue slow
+      // "latent" mentorProgress via mentorProtege()'s own session (see
+      // app_actions.js). processGridRetirements() (engine.js) scans this
+      // WHOLE array for a graduated prospect, not just p.protege, since
+      // more than one can reach 100 independently over time.
     joinedTeamOnSeason: number,
       // season the player joined their CURRENT team; a real team switch
       // resets this and costs morale (team-switch cooldown), a same-team
       // contract renewal does not
+    releaseClauseUsedThisContract: boolean,
+      // Contract release clause (Pass 22, feature idea #9) -- true once the
+      // player has requested an early release from the CURRENT contract;
+      // resets to false on every new contract signed (renewal or switch).
+      // See renderReleaseClauseConfirmModal() (app_screens.js).
+    simRacingRep: number,
+      // Sim racing side career (Pass 22, feature idea #15) -- uncapped,
+      // purely additive reputation grown via Free Time's Sim Racing
+      // activity. Gates the Circuitworks cross-over sponsor (SPONSOR_POOL,
+      // data.js, needsSimRacingRep:true) at >=40 via sponsorUnlocked().
+    isTeamOwner: boolean,
+      // Team Ownership Mode (Pass 22, feature idea #13) -- set once at
+      // character creation, never changes mid-career. When true, race
+      // weekends auto-resolve (see autoResolveOwnerRaceWeekend(),
+      // app_race.js) instead of the player choosing strategy.
+    contract:{teamId,years,salary,clause,roadmapMilestone:null|{type,targetYear,target,reward,met:null|boolean,signedSeason,podiumsAtSigning}},
+      // roadmapMilestone (Pass 22, feature idea #11) -- an OPTIONAL, visible
+      // upfront milestone on multi-year (2+) contract offers, distinct from
+      // the existing hidden performance `clause`. Checked in
+      // handleSeasonEnd() at the stated targetYear; met=true pays out
+      // reward.salaryRaise, met=false has NO penalty (pure upside, unlike a
+      // missed clause which forces years to 0).
     seenStatEffectExplainer, seenMentorExplainer, seenRomanceExplainer,
     seenSponsorExplainer, seenDevSlotsExplainer, seenCelebrityExplainer: boolean|undefined,
       // one flag per first-time-explainer -- see ARCHITECTURE above for the
       // full current list; grep `showFirstTimeExplainer(` to double check
   },
+  trackRecords: {[trackId]:{driverName,lapTimeText,season,isPlayer:boolean}},
+    // Track records board (Pass 22, feature idea #4) -- fastest lap EVER
+    // recorded at each circuit this save, any driver, updated in
+    // finishExecuteRace() (app_race.js) right after rollFastestLap(), only
+    // overwritten when plausibleLapTime()'s parsed seconds are genuinely
+    // lower than the existing record. Museum-only display, never read by
+    // any mechanical system.
+  pendingSponsorRenewals: [sponsorName, ...],
+    // Sponsor renewal negotiation (Pass 22, feature idea #3) -- queued by
+    // checkSponsorObjectives() (app_actions.js) the instant a sponsor's
+    // 10th goal completes, INSTEAD of auto-converting to permanent.
+    // Resolved via renderSponsorRenewalModal() (Lock In = guaranteed
+    // current rate, Renegotiate = 55% chance of a real raise / 45% chance
+    // goalsCompleted knocks back to 7). Chained into the race-result
+    // advance flow right after the podium interview, must-resolve.
   grid: [ /* ~21 AI drivers + player = 22 total, see makeRivalDriver() in engine.js */
     { id,name,teamId,age,nationality,flag,drivingStyle,gender:'M',
       attributes:{...}, fanPopularity, mediaReputation, traits:[],
@@ -407,6 +537,20 @@ Re-derived directly from `createPlayer()`/`createDriverAttributes()`
         // rolled once by rollRivalryOrigin() (data.js RIVALRY_ORIGINS) the
         // moment this driver is FIRST crowned rivalId -- stable for the
         // life of the rivalry, never re-rolled
+      teammateTally: {wins,losses}|undefined,
+        // Teammate relationship arc (Pass 19) -- only ever set/read on
+        // whichever grid driver currently shares p.teamId; same shape as
+        // headToHead but THIS-season-scoped (captured + reset to
+        // {wins:0,losses:0} in handleSeasonEnd(), app_screens.js, right
+        // before processGridRetirements() could wipe it via a driver
+        // replacement)
+      careerLegacy: {worldTitles,dns,highestSeasonPoints,highestSeasonYear,rookie}|null,
+        // Pass 20 -- display-only pre-loaded career extras for NAMED
+        // drivers only (TEAM_DRIVER_PROFILES, data.js); null for any
+        // driver generated without a matching profile (fresh rookies,
+        // retirement replacements). Never read by any mechanical system --
+        // see driver.careerStats below for the fields that actually feed
+        // game logic.
       isLegend: true|undefined, isProtegeGraduate: true|undefined,
       romance:{status,spark} }
   ],
@@ -417,6 +561,15 @@ Re-derived directly from `createPlayer()`/`createDriverAttributes()`
     // midSeasonDev* guard the one-time mid-season AI development bump so it
     // can only ever fire once per season
   dayIndex:0-6, week:number, standings:{[driverId]:points},
+  constructorPoints:{[teamId]:points},
+    // Constructors' Championship (Pass 19/21) -- tracked SEPARATELY from
+    // standings, incremented at the exact moment points are scored against
+    // whichever teamId a driver was on AT THAT MOMENT (executeRace()/
+    // resolveSprintRace(), app_race.js) -- NEVER derive this from summing
+    // standings for drivers who currently have a given teamId, that was a
+    // real bug (Pass 21) that let a mid-season switch silently move a
+    // driver's whole season total to their new team. Reset alongside
+    // standings at season start/end.
   newsFeed:['string w/ emoji'], seasonStats:{wins,podiums,points,beatTeammate,q3count},
   seasonObjectives:[{type,text,target,reward:{money,rep}}],   // regenerated each season AND on any team switch
   npcRoster: [ {id,role,name,gender,tenureSeasons,relationship:{friendship,trust,affection,respect,compatibility,memories},
@@ -449,6 +602,16 @@ Re-derived directly from `createPlayer()`/`createDriverAttributes()`
   scoutingOffer:null|{teamId,years,salary,reason},  // unsolicited mid-contract offer from checkScoutingInterest(), engine.js
   seasonStartCareerWins:{[driverId]:number},  // snapshot at season start, used to compute "beat teammate this season" style deltas
   lastRaceHeadline:null|{track,position,dnf},  // feeds the Home hub's most-recent-result display; cleared at season start
+  abandonedDriverNames: string[],
+    // Pass 20 -- names permanently removed from this career's named-driver
+    // pool by a teammate pick at character creation (renderTeammatePickModal(),
+    // app_core.js -- generateGrid()'s abandonedName). Checked by
+    // generateFreshDriverName() (engine.js) so an abandoned choice can never
+    // resurface later as a "fresh" rookie replacement either. Set once at
+    // career start, never mutated after (a mid-career switch's un-picked
+    // driver is NOT added here -- see rebalanceGridForTeamChange()'s
+    // keepDriverId, which handles that case differently, by replacement not
+    // erasure).
 }
 ```
 
@@ -555,6 +718,40 @@ Player-facing explanation lives in the "Skill Ceiling" Help topic
 - TEAMS<->state persistence → `app_core.js syncTeamsToState()`/`syncTeamsFromState()` — see ARCHITECTURE above
 - Colors/fonts/spacing → `styles.css` (`:root` first)
 - Boot screen branding → `app_core.js renderBoot()` + `shell.html <title>`
+- Season awards mechanical rewards → `data.js SEASON_AWARD_REWARDS`/`seasonAwardReward()`, applied in `app_screens.js handleSeasonEnd()`
+- Chief Engineer setup reveal → `app_race.js renderSetupSliders()`, gated on Chief Engineer `relationship.trust>=85`, rolled once per round via `round.chiefEngineerRevealRolled`
+- Home Tracks → `engine.js isHomeTrack()`/`HOME_TRACK_THRESHOLD`/`HOME_TRACK_PACE_BONUS`, `driver.isHomeTrackBonus` set in `app_race.js` alongside `familiarityBonus`, badge in `renderRaceCenterScreen()`
+- Multi-weekend mechanical-risk chain → `engine.js applyMechanicalRiskAfterDNF()`/`decayMechanicalRisk()`/`clearMechanicalRisk()`, `p.mechanicalRiskMult` read inside `simulateRace()`'s failChance, wired in `app_race.js executeRace()`, cleared via `app_screens.js renderTeamScreen()`'s "Address Reliability Concern" button
+- Controversy events → `data.js CONTROVERSY_EVENTS`/`pickControversyEvent()`, rolled in `app_hub.js maybeTriggerControversyEvent()`/`advanceDay()`, shown via `renderControversyModal()`
+- Teammate relationship arc → `driver.teammateTally` tracked in `app_race.js executeRace()`, shown in `app_actions.js renderRelationshipsModal()` and captured/reset in `app_screens.js handleSeasonEnd()`
+- Constructors' Championship → `app_hub.js constructorsStandings()` (reads `state.constructorPoints`, NOT derived from `s.standings`+current team), points tracked at scoring time in `app_race.js executeRace()`/`resolveSprintRace()`, displayed in `app_screens.js renderTeamScreen()` and `renderSeasonWrapModal()`
+- Multi-driver press conference → `app_actions.js renderMediaModal()`'s `presentFromLastRace()` check
+- Manager/Agent NPC → 8th role in `app_core.js generateNpcRoster()`, talk lines in `app_actions.js getTalkLinesForRole()`, sponsor-lead flavor in `data.js MANAGER_LEAD_LINES`/`managerLeadLine()`
+- Pit-stop strategy (undercut/overcut) → `app_race.js maybeApplyPitStopStrategy()`, selected in `renderRaceStrategyPrompt()`, threaded through `renderFormationLapMoment()`/`executeRace()`
+- Qualifying red flag (Q3 deletion) → `app_race.js maybeApplyQualifyingRedFlag()`, called from `resolveQualifying()`
+- Multi-season storyline callbacks → `app_race.js checkMultiSeasonCallbacks()`, called from `executeRace()` alongside `checkMilestones()`
+- LEGACY_KEY/HOF_KEY rename+migration → `engine.js` (`LEGACY_KEY`/`OLD_LEGACY_KEY`, `HOF_KEY`/`OLD_HOF_KEY`), same pattern as `SAVE_KEY`/`OLD_SAVE_KEY`
+- Named driver roster (nationality/age/bio/pre-loaded careerStats per team) → `data.js TEAM_DRIVER_PROFILES` (source of truth; `RIVAL_DRIVER_NAMES` is derived FROM this, don't hand-maintain it separately)
+- Manual teammate pick (character creation + mid-career switches) → `app_core.js renderTeammatePickModal()`, called from `renderCreateCharacter()`'s Start Career button and from `app_screens.js renderScoutingOfferModal()`/`renderContractOffersModal()`'s accept handlers on any genuine team change
+- Grid generation with an explicit teammate choice → `engine.js generateGrid(playerTeamId, playerTeammateChoice)` returns `{grid, abandonedName}` (NOT a bare array)
+- Mid-career team-switch driver-keep choice → `engine.js rebalanceGridForTeamChange(state, oldTeamId, newTeamId, keepDriverId)`
+- **(Pass 22)** Weather radar trend strip → `app_hub.js renderRadarTrendStrip()`, called from the same forecast-chip function that already calls `forecastGuess()`
+- **(Pass 22)** Paddock vote (season-end flavor comparison) → `app_screens.js computePaddockVote()`, called from `handleSeasonEnd()`, rendered in `renderSeasonWrapModal()`
+- **(Pass 22)** Sponsor renewal negotiation → `app_actions.js checkSponsorObjectives()` (queues `s.pendingSponsorRenewals` at the 10th goal instead of auto-converting) + `renderSponsorRenewalModal()`, chained into the race-result advance flow in `app_race.js finishExecuteRace()`
+- **(Pass 22)** Track records board → `app_race.js finishExecuteRace()` (writes `s.trackRecords`, reuses `plausibleLapTime()`), displayed in `app_screens.js renderMuseumModal()`
+- **(Pass 22)** Home track testimonial → `app_race.js runPracticeQuiz()`'s onComplete, fire-once via `p.milestones` keyed per-track (`home_track_${trackId}`)
+- **(Pass 22)** Practice program choices → `app_race.js PRACTICE_PROGRAMS`/`renderPracticeProgramModal()`/`runPracticeQuiz()` — replaces the old always-automatic `pickPracticeQuizTheme()` roll for the practice flow specifically (qualifying's own theme picker is untouched)
+- **(Pass 22)** Team orders → `app_race.js maybeDetectTeamOrdersMoment()`/`applyTeamOrdersSwap()`/`renderTeamOrdersModal()`, detected in `executeRace()` right after every other post-scoring event has settled, resolved via a modal BEFORE `finishExecuteRace()` continues
+- **(Pass 22)** Podium press pool with multiple journalists → `app_actions.js GUEST_JOURNALISTS`/`pickPressInterviewer()`, called from `renderMediaModal()`; a guest's presence changes question framing only, relationship state always stays on the regular roster Journalist
+- **(Pass 22)** Contract release clause → `app_screens.js renderReleaseClauseSection()`/`renderReleaseClauseConfirmModal()`/`releaseClauseCost()`, shown on the Team screen contract panel
+- **(Pass 22)** Simulator "what-if" mode → `app_race.js renderSimulatorPreviewModal()`, called from Race Center; UI-only, runs a throwaway `simulateQualifying()` call that never mutates real state
+- **(Pass 22)** Multi-year contract roadmap milestones → generated in `app_screens.js renderContractOffersModal()` (`o.roadmapMilestone`, 2+ year offers only), persisted onto `p.contract.roadmapMilestone` at signing, checked in `handleSeasonEnd()`
+- **(Pass 22)** Junior series prologue → `app_core.js runJuniorSeriesPrologue()`/`renderJuniorSeriesIntro()`/`runJuniorSeriesRound()`/`finishJuniorSeriesPrologue()`, runs right after `startNewCareer()` creates state, before the hub/chrome is shown
+- **(Pass 22)** Team Ownership Mode → `app_core.js` (character-creation toggle, `player.isTeamOwner`), `app_race.js autoResolveOwnerRaceWeekend()`/`this._ownerSilent` (makes `openModal`/`closeModal`/`startQuizMiniGame` no-op/auto-resolve instead of duplicating scoring logic), `app_hub.js renderTodayActions()`'s owner-mode branch
+- **(Pass 22)** Weather microclimates → `data.js TRACKS[].microclimate` flag (Spa, Silverstone), `app_race.js maybeApplyWeatherShift(results, weather, track)`'s track-aware fire rate
+- **(Pass 22)** Sim racing side career → `app_actions.js doSimRacingActivity()`, `SPONSOR_POOL`'s Circuitworks entry (`needsSimRacingRep:true`) gated via `data.js sponsorUnlocked()` (layers on top of `sponsorTierUnlocked()`, doesn't replace it)
+- **(Pass 22)** Driver academy roster → `app_actions.js ACADEMY_MAX_SIZE`/`renderMentorModal()`/`recruitAcademyProspect()`/`mentorProtege()`, `engine.js processGridRetirements()` scans the whole `p.protegeRoster` for a graduated prospect
+- **(Pass 22)** Legend exhibition mode → `app_screens.js LEGEND_EXHIBITION_POOL`/`buildLegendExhibitionGrid()`/`renderLegendExhibitionModal()`, reuses `makeLegendDriver()`/`simulateQualifying()`/`simulateRace()` directly; non-persistent, never touches `App.state`
 
 ---
 
@@ -597,60 +794,41 @@ Player-facing explanation lives in the "Skill Ceiling" Help topic
 
 ---
 
-## REMAINING BACKLOG (not built yet)
+## REMAINING BACKLOG
 
-Open-ended feature ideas — each deserves its own scoping conversation (what
-mechanic, why, how it interacts with existing systems) before any code.
-There are currently no small/independently-scoped "gaps to fix" outstanding;
-everything previously listed there has been closed (see CHANGELOG).
+Everything Pass 22's 17 feature ideas covered is DONE (see CHANGELOG for
+the list and scope notes). What's genuinely left:
 
-- Season awards (`computeSeasonAwards()`, `app_screens.js`) getting a real
-  mechanical hook instead of badge-only, mirroring the archetype/trait
-  hook pattern already used repeatedly elsewhere
-- NPC roster staff involvement in race weekend itself (e.g. a high-trust
-  Chief Engineer occasionally reveals the ideal setup outright)
-- Track familiarity surfaced as its own "home tracks" concept, not just a
-  hidden setup-hint input
-- A multi-weekend consequence chain for mechanical failures (this
-  weekend's DNF slightly raises next weekend's risk unless addressed)
-- Public-perception moments that swing fanPopularity/mediaReputation in
-  opposite directions based on a real stance — **partially already built**:
-  `renderMediaModal()` (`app_actions.js`) already has stance-based branches
-  that swing team morale/reputation in different directions (e.g. "Blame
-  the car" hurts morale, "Fire back with confidence" escalates rivalry
-  instead of just giving a uniform plus). Remaining gap is narrower than it
-  sounds: a dedicated one-off "controversy" event type distinct from the
-  existing race-result/rivalry press questions, if that's still wanted.
-- Teammate relationship arc / season-long head-to-head storyline
-- Constructors' championship (mostly a display layer over `TEAMS[].
-  carStrength`/`reliability`, which already exist)
-- Post-race press conference as a multi-driver moment, not always 1-on-1
-  (`renderMediaModal()`, `app_actions.js` is currently player-only) —
-  rival/teammate presence in the room changing which options appear
-- A Manager/Agent NPC role (the 7 fixed `generateNpcRoster()` roles,
-  `app_core.js`, don't include anyone who negotiates on the player's
-  behalf) — occasional contract pushback or a sponsor lead the player
-  wouldn't otherwise see
-- Weekend-long tire/fuel strategy instead of one single choice — a mid-
-  race pit-stop-timing decision (undercut/overcut), resolved the same
-  presentational post-scoring way the safety car and grid penalty events
-  already are (`simulateRace()`, `engine.js`), so it wouldn't touch core
-  sim math
-- A qualifying "moment" to match the race's — Q1/Q2/Q3 elimination
-  framing is already cosmetic (`app_race.js`, the `expectedSegment`
-  labeling), so a small-chance red-flag/track-limits deletion event in
-  Q3, same post-scoring pattern as the safety car, would give qualifying
-  its own drama beat
-- Multi-season storyline callbacks — milestones/journal entries are all
-  one-off; a thread that resurfaces 2-3 seasons later (a mentored
-  protégé becoming a rival, a team you left resenting you) would reuse
-  `history[]` and the existing protégé/legend-driver machinery
-  (`makeProtege`/`makeLegendDriver`, `engine.js`) rather than needing new
-  state
-- SAVE_KEY's sibling keys (`LEGACY_KEY`/`HOF_KEY`, both still
-  `'apexpal_...'`) could get the same rename-with-migration treatment
-  `SAVE_KEY` got in Pass 15, if wanted — deliberately left alone so far
-  since it wasn't asked for and touches two separate persistence paths
+- **Team Ownership Mode's own dedicated screens.** Pass 22 deliberately
+  scoped this down to a flag-on-the-existing-save-shape implementation
+  (auto-resolved race weekends via `_ownerSilent`, the player's own driver
+  still exists) rather than the brief's full "own UI screens and a
+  redesigned driverStrength consumer for two AI-controlled seats." A truly
+  separate two-seat management screen (hiring/firing two AI drivers,
+  strategy calls FOR them, a development-budget-only view with no driver
+  stats at all) would need `simulateRace()`'s player-vs-grid distinction
+  rebuilt — real, substantial surgery on the core sim, not attempted here.
+- **Dedicated automated tests for older Pass 19 mechanics** beyond what
+  Pass 22 added: mechanical-risk chain, teammate battle arc, season award
+  rewards, controversy events, Manager NPC, multi-season callbacks are
+  still only covered indirectly (via regression_test.js's full playthrough
+  and scattered assertions elsewhere), not by their own targeted checks.
+- **Driver Academy's bench prospects have no individual "arc"** beyond a
+  shared latent-progress trickle — the brief mentioned "each with their own
+  arc"; what shipped is a shared mechanical trickle, not distinct narrative
+  beats per bench prospect. A real per-prospect arc (journal entries,
+  personality, a name the player gets attached to before they even start
+  training) would be a reasonable next increment.
+- **Simulator "what-if" mode only previews qualifying**, not a full race
+  outcome, despite the feature idea's framing ("qualifying/race outcome").
+  Previewing a full race would need a throwaway `simulateRace()` call too
+  (cheap to add — the qualifying preview's pattern generalizes directly)
+  but wasn't done to keep the preview screen simple/fast.
+- **Legend Exhibition's opponent pool is a fixed 20-name flavor list**
+  (`LEGEND_EXHIBITION_POOL`, app_screens.js), not drawn from real
+  in-save history (e.g. actual retired grid drivers from THIS save, or
+  Hall of Fame entries). A "true greatest grid" pulling from the player's
+  own Hall of Fame would be a natural follow-up.
 
 ---
 
@@ -670,7 +848,14 @@ everything previously listed there has been closed (see CHANGELOG).
 - **Pass 12** – Gameplay stat audit and rebalance, expanded trait system, improved stat explanations, race modifier display, documentation improvements.
 - **Pass 13** – Combined gameplay-flow/UI-UX pass and tutorial/onboarding audit: welcome tour now covers tire compounds, sprint weekends, and mentor/protégé; added Sprint Weekends and Mentor a Protégé to the Help reference; added first-time explainers for sponsor signing and protégé recruitment; tire compound tradeoffs promoted from hover-only tooltips to visible text.
 - **Pass 14** – Simplified every tutorial/help/first-time-explainer text into short scannable lines (later reverted — see Pass 16).
-- **Pass 15** – Closed six standing gaps together: weighted fastest-lap roll (`rollFastestLap()`) feeding `careerStats.fastestLaps` + a small bonus + result-modal banner; removed the dead `state.player.relationships` field; added rivalry-origin flavor text (`RIVALRY_ORIGINS`/`rollRivalryOrigin()`); added sponsor type-specific goal-completion dialogue (`SPONSOR_GOAL_LINES`/`sponsorGoalLine()`); added three new training programs giving `fuelSaving`/`discipline`/`leadership` a real write path; renamed `SAVE_KEY` to `'formulaonedirection_save_v1'` with a migration fallback from the old key.
-- **Pass 16** – Triggered the 5 remaining `TRAIT_POOL` traits (Lucky, Leader, Fragile, Bad Starter, Overconfident), each with a small real mechanical hook — all 11 traits now mechanically real. Added track-specific quiz questions for all 18 `TRACKS` via a new `trackId` field, filtered so a track's question can never surface elsewhere. Reverted Pass 14's `<br>`-line-fragment text format back to flowing paragraphs — same content, formatting only.
-- **Pass 17** – Fixed six shallow/cosmetic-only systems flagged by a full-codebase audit: `respect` (previously write-only) now affects rivalry-gain rate, gates Hot Head, and affects Team Principal turnover timing; Driving Style (previously 100% cosmetic) now has a small real pace/tire-wear effect, and `radioLine()` no longer silently drops style flavor into the wrong bank; NPC `personality` now flavors all 7 roles' dialogue (previously Race-Engineer-only); team `culture` flavor text is now backed by `devTrend.volatility` scaling morale-swing magnitude; all 9 `REPUTATION_ARCHETYPES` (5 were pure badges, plus a dead `veteran` archetype) now have real hooks; `careerStats.fastestLaps`/`wetWins` now feed milestones.
-- **Pass 18** – Anti-overpower balance system, three linked mechanics: (1) player driving/mental stats are capped at the current points-standings leader's same stat + 8, re-evaluated live on every `saveState()` via the new `enforcePlayerSkillCap()` (`app_core.js`); (2) AI grid drivers now drift season-over-season (`developGridDriversForNewSeason()`, `engine.js`) biased by age, so the points leader — and therefore the cap — genuinely shifts identity over a career instead of staying fixed; (3) player stats fade by 2 points every season-end (`handleSeasonEnd()`, `app_screens.js`), smaller than a typical training gain so regular training more than offsets it. Added a "Skill Ceiling" Help topic and a near-cap indicator in the Training modal. Also did a full rewrite of this document: removed stale claims (explainer count, "as of Pass N" changelog-in-quick-reference phrasing), verified every count (11 traits, 9 archetypes, 18 tracks, 11 teams, 10 sponsors, 13 training programs, 9 tutorial steps, 20 Help topics) directly against code, and folded the two prior standalone "Documentation Audit"/"Documentation Reorganization" changelog entries into this rewrite rather than keeping them as separate historical lines with nothing left to point to.
+- **Pass 15** – Gameplay expansion: fastest laps, rivalry origins, sponsor dialogue, new training programs, save migration, cleanup.
+- **Pass 16** – Activated all remaining traits, expanded track-specific quizzes, restored tutorial formatting.
+- **Pass 17** – Gave previously cosmetic systems real gameplay impact (respect, driving style, personalities, team culture, reputation archetypes, milestones).
+- **Pass 18** – Anti-overpower balance system (dynamic skill cap, AI progression, seasonal stat decay), Skill Ceiling help, documentation audit/rewrite.
+- **Pass 19** – Completed remaining gameplay backlog: season awards, Home Tracks, Constructors' Championship, teammate rivalry, manager role, pit strategy, controversy events, reliability chain, multi-driver press, qualifying red flags, multi-season callbacks, expanded tracks/question pool, balancing, bug fixes, verification.
+- **Pass 20** – Replaced generic roster with named teams/drivers, teammate selection, AI career histories, nationality expansion, grid-generation update, compatibility and test fixes.
+- **Pass 21** – Full audit pass: major gameplay bug fixes, dead-code cleanup, Help expansion, UI audit, test consolidation.
+- **Pass 22** – Combined pass: 17 new feature ideas
+  core) — every flaky check was individually verified to pass in isolation.
+  See TESTING WORKFLOW's gotcha note below for the diagnostic pattern and
+  the mitigation already applied (splitting suite_features_test.js in two).
