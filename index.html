@@ -3484,20 +3484,43 @@ const App = {
      retroactive nudge directly to the freshly-created player's
      driving/mental attributes (same clamp(...,0,99) shape
      createDriverAttributes() itself already produces), respecting the
-     skill-cap-eligible 0-99 range every other stat write already respects. */
+     skill-cap-eligible 0-99 range every other stat write already respects.
+     Bugfix (user-reported): the prologue opponent used to come from a
+     separate 3-name flavor pool (JUNIOR_SERIES_OPPONENTS, now removed)
+     with no connection to the real grid at all -- when that flavor name
+     was later written onto a real driver's own .name field to seed the
+     first rival (see finishJuniorSeriesPrologue() below), it could
+     silently clobber a genuine named-profile driver's identity (e.g.
+     George Raven overwritten with the unrelated flavor name "Rafael
+     Duarte"). Per direct user request, the separate pool is gone
+     entirely -- the prologue opponent is now a REAL rookie driver already
+     on the 22-driver grid (a driver with a genuinely blank/near-blank
+     career record, not a random veteran), picked ONCE at prologue start
+     and used consistently by their real name through every round and the
+     eventual rival-seeding at the end. No name is ever invented or
+     overwritten. */
   runJuniorSeriesPrologue(){
-    this._prologueState = { round: 0, totalRounds: 3, correctTotal: 0, questionTotal: 0 };
+    this._prologueState = { round: 0, totalRounds: 3, correctTotal: 0, questionTotal: 0, opponent: this.pickJuniorSeriesOpponent() };
     this.renderJuniorSeriesIntro();
   },
-  /* Feature idea #10 -- seed the player's very first grid rival from one of
-     the prologue's quiz-flavor "opponents", giving the origin story a tie
-     back to the prologue instead of a cold-start rivalry (updateRivalry(),
-     app_race.js, would otherwise only build one up organically race by
-     race with no starting narrative). One flavor name per prologue round --
-     purely a name/origin-text pool, not a new driver-generation system. */
-  JUNIOR_SERIES_OPPONENTS: [
-    'Theo Marchetti', 'Ines Kovac', 'Rafael Duarte',
-  ],
+  /* Picks a real rookie AI grid driver to play the role of the prologue's
+     recurring opponent -- never the player's own teammate (so the origin
+     rivalry this eventually seeds stays distinct from the separate
+     teammate relationship arc). "Rookie" means careerLegacy.rookie:true
+     (the same flag TEAM_DRIVER_PROFILES/makeRivalDriver() already use for
+     a driver with no real career behind them yet -- see engine.js).
+     Prefers a driver with a genuinely blank record (careerStats.starts===0)
+     over one with just a start or two on the board, but falls back to any
+     rookie, then to any non-teammate driver at all, so this can never
+     fail to find someone on a fresh 22-driver grid. */
+  pickJuniorSeriesOpponent(){
+    const s = this.state; const p = s.player;
+    const candidates = s.grid.filter(d=>d.teamId!==p.teamId);
+    const blankRookies = candidates.filter(d=>d.careerLegacy && d.careerLegacy.rookie && d.careerStats && d.careerStats.starts===0);
+    const anyRookies = candidates.filter(d=>d.careerLegacy && d.careerLegacy.rookie);
+    const pool = blankRookies.length ? blankRookies : (anyRookies.length ? anyRookies : candidates);
+    return pool.length ? pick(pool) : null;
+  },
   renderJuniorSeriesIntro(){
     this.root.innerHTML = `
       <div class="create-wrap" style="text-align:center;">
@@ -3515,20 +3538,19 @@ const App = {
     const ps = this._prologueState;
     const rounds = ['Junior Series Round 1', 'Junior Series Round 2', 'Junior Series Finale'];
     const themes = ['setup','tires','strategy'];
-    const opponent = this.JUNIOR_SERIES_OPPONENTS[ps.round % this.JUNIOR_SERIES_OPPONENTS.length];
+    const opponentName = ps.opponent ? ps.opponent.name : 'a rival junior driver';
     this.startQuizMiniGame({
       title: rounds[ps.round],
-      subtitle: `Head-to-head with ${opponent} before F1`,
+      subtitle: `Head-to-head with ${opponentName} before F1`,
       theme: themes[ps.round % themes.length],
       questionCount: 3,
       trackId: null,
       onComplete: (scorePct)=>{
         ps.correctTotal += Math.round(scorePct*3);
         ps.questionTotal += 3;
-        // Track how the player did specifically against the LAST round's
-        // opponent -- the finale opponent becomes the seeded rival below,
-        // so only that round's own performance matters for the origin text.
-        ps.lastOpponent = opponent;
+        // Track how the player did in the LAST round specifically -- only
+        // the finale's own result matters for the rivalry-origin text
+        // below.
         ps.lastOpponentScorePct = scorePct;
         ps.round++;
         if(ps.round < ps.totalRounds){
@@ -3568,27 +3590,25 @@ const App = {
       p.journal.unshift({season:s.season, week:s.week, title:'Junior Series Complete', text:`${Math.round(overallPct*100)}% (${ps.correctTotal}/${ps.questionTotal}) — ${line}`, icon:'🏁'});
       this.toast(`🏁 Junior Series complete: ${Math.round(overallPct*100)}%.`);
       // Feature idea #10 -- seed the player's first rival from the
-      // prologue's finale opponent. Picks a real grid driver (not the
-      // player's own teammate, so the origin rivalry isn't confused with
-      // the separate teammate relationship arc) and renames them to match
-      // the finale opponent's flavor name, with a small starting
-      // rivalryLevel and a dedicated origin line -- a genuine narrative
-      // head start rather than the fully cold-start rivalry
-      // updateRivalry() would otherwise build up race by race with no
-      // tie-in at all. Only fires when the finale was actually played
-      // (ps.lastOpponent set) and there's a non-teammate grid driver to
-      // attach it to.
-      if(ps.lastOpponent){
-        const candidate = s.grid.find(d=>d.teamId!==p.teamId);
+      // prologue's finale opponent. The opponent (ps.opponent) is now a
+      // REAL grid driver picked once at prologue start (see
+      // pickJuniorSeriesOpponent() above) -- their own real name/identity
+      // is used throughout, never overwritten or invented, so there's no
+      // longer any risk of clobbering a named-profile driver's identity.
+      // Only fires when the finale was actually played AND that same
+      // driver is still validly on the grid, not the player's teammate
+      // (a mid-prologue edge case, e.g. some other system somehow
+      // touching the grid mid-prologue, though nothing currently does).
+      if(ps.opponent){
+        const candidate = s.grid.find(d=>d.id===ps.opponent.id && d.teamId!==p.teamId);
         if(candidate){
-          candidate.name = ps.lastOpponent;
           const closeFinale = ps.lastOpponentScorePct!==undefined && ps.lastOpponentScorePct < 0.6;
           candidate.rivalryLevel = clamp((candidate.rivalryLevel||0) + (closeFinale ? 26 : 22), 0, 100);
           candidate.rivalryOrigin = closeFinale
-            ? `${ps.lastOpponent} narrowly got the better of you in the junior series finale — a rivalry born before F1 even started.`
-            : `You and ${ps.lastOpponent} were the two names to watch in the junior series — old habits die hard.`;
+            ? `${candidate.name} narrowly got the better of you in the junior series finale — a rivalry born before F1 even started.`
+            : `You and ${candidate.name} were the two names to watch in the junior series — old habits die hard.`;
           s.rivalId = candidate.id;
-          p.journal.unshift({season:s.season, week:s.week, title:'A Familiar Face', text:`${ps.lastOpponent} — your junior series finale opponent — has made the grid too. The rivalry continues in F1.`, icon:'⚔️'});
+          p.journal.unshift({season:s.season, week:s.week, title:'A Familiar Face', text:`${candidate.name} — your junior series finale opponent — has made the grid too. The rivalry continues in F1.`, icon:'⚔️'});
         }
       }
     }
