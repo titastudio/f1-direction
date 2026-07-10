@@ -1622,18 +1622,38 @@ function makeRivalDriver(name, teamId){
    fallback pool (484 combinations, see data.js); (3) an extremely unlikely
    last resort of appending a Roman-numeral-style suffix, which only fires
    if literally every combination in both pools is simultaneously in use. */
-function generateFreshDriverName(state, teamId){
+function generateFreshDriverName(state, teamId, isVacatedSeat){
   const usedNames = new Set(state.grid.map(d=>d.name));
   if(state.player) usedNames.add(state.player.name);
-  // Names abandoned at a teammate-pick step (renderTeammatePickModal(),
-  // app_core.js -- either at career start or a mid-career team switch) must
-  // never resurface, including as a "fresh" replacement for that same team
-  // later -- the whole point of the pick is that the other choice is gone
-  // for good, not just benched. state.abandonedDriverNames is a flat array
-  // (not per-team) since a name is unique across the whole named-roster
-  // pool anyway; excluding it everywhere is simpler and no less correct
-  // than excluding it only for its original team.
-  (state.abandonedDriverNames||[]).forEach(n=> usedNames.add(n));
+  // Bugfix: this previously excluded an abandoned teammate-pick name (see
+  // generateGrid()'s own abandonedName, further down) from EVERY team's
+  // fresh-driver generation, forever -- including that name's own
+  // ORIGINAL team. Confirmed reproducible: start a career at Silver
+  // Arrows, pick Kimi Anton as teammate (abandoning George Raven), later
+  // switch to a different team -- Silver Arrows' now-vacant seat (the one
+  // the player just left) generates a random cross-combined fallback name
+  // (e.g. "Rafael Duarte") instead of George Raven, who by all rights
+  // should still exist and be racing for his own team regardless of the
+  // player's own career path.
+  //
+  // The exclusion is now scoped to ONLY the player's actual current/
+  // future seat -- an abandoned name can never become the player's
+  // teammate again (the original intent this field exists for -- "gone
+  // for good" as far as the PLAYER's seat is concerned), but is otherwise
+  // free to appear anywhere else on the grid, including back on its own
+  // original team.
+  //
+  // isVacatedSeat is an explicit flag from the caller, NOT inferred from
+  // state.player.teamId -- confirmed via direct reproduction that
+  // inferring it that way breaks at exactly the moment it matters most:
+  // rebalanceGridForTeamChange() (below) generates the OLD team's
+  // replacement BEFORE player.teamId is updated to the new team (every
+  // real call site does this in that order), so at generation time
+  // state.player.teamId still equals the OLD/vacated team, making the two
+  // cases indistinguishable by teamId alone.
+  if(!isVacatedSeat){
+    (state.abandonedDriverNames||[]).forEach(n=> usedNames.add(n));
+  }
 
   const ownPoolCandidates = (RIVAL_DRIVER_NAMES[teamId]||[]).filter(n=>!usedNames.has(n));
   if(ownPoolCandidates.length) return pick(ownPoolCandidates);
@@ -1724,10 +1744,14 @@ function rebalanceGridForTeamChange(state, oldTeamId, newTeamId, keepDriverId){
   }
 
   // Give the old team a fresh AI driver back, entering as a young rookie —
-  // this is the seat the player just vacated.
+  // this is the seat the player just vacated. isVacatedSeat=true here is
+  // the fix's whole point: this is generating for the OLD team (the one
+  // being LEFT), not the player's new seat, so an abandoned teammate-pick
+  // name is free to return here even though state.player.teamId hasn't
+  // been updated to the new team yet at this point in the call sequence.
   const oldTeamDrivers = state.grid.filter(d=>d.teamId===oldTeamId);
   if(oldTeamDrivers.length < 2){
-    const freshName = generateFreshDriverName(state, oldTeamId);
+    const freshName = generateFreshDriverName(state, oldTeamId, true);
     const replacement = makeRivalDriver(freshName, oldTeamId);
     replacement.age = randInt(19, 23);
     state.grid.push(replacement);
