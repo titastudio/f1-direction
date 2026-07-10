@@ -1358,6 +1358,24 @@ function checkContractClauseMet(clause, state, standing){
    small, capped flavor bonus — never enough to define outcomes on its own. */
 const COSMETIC_CATEGORIES = ['helmet','livery','suit','gloves'];
 
+/* Feature idea #18 -- livery/car customization, cosmetic-only. Deliberately
+   SEPARATE from the 'livery' entries in COSMETIC_POOL above -- those are
+   unlock-gated and carry small mechanical bonuses (part of the existing
+   progression system); this is a purely decorative car color/decal picker,
+   reusing that SAME {id,name,icon,desc} shape/pattern (same field names, so
+   the same rendering approach in renderProfileModal() works for both pools)
+   but with no unlock gating and no bonus field at all -- available from
+   the very first day of a career, chosen purely for how it looks. */
+const CAR_COLORWAY_POOL = [
+  {id:'colorway_default', name:'Team Standard', icon:'🎨', desc:'Your team\'s stock color scheme.'},
+  {id:'colorway_crimson', name:'Crimson Stripe', icon:'🟥', desc:'A bold red stripe down the nose.'},
+  {id:'colorway_azure', name:'Azure Fade', icon:'🟦', desc:'A cool blue gradient across the sidepods.'},
+  {id:'colorway_gold', name:'Gold Trim', icon:'🟨', desc:'Gold accents on the wing endplates.'},
+  {id:'colorway_mono', name:'Monochrome', icon:'⬛', desc:'Stealthy all-black with minimal branding.'},
+  {id:'colorway_sunset', name:'Sunset Fade', icon:'🟧', desc:'An orange-to-pink gradient wrap.'},
+  {id:'colorway_racing_green', name:'Racing Green', icon:'🟩', desc:'A heritage-inspired deep green.'},
+];
+
 const COSMETIC_POOL = [
   // ---- Helmets ----
   {id:'helmet_default', category:'helmet', name:'Classic Design', icon:'⛑️', seasonOffset:0, unlockRound:0, bonus:null, desc:'Your starting design.'},
@@ -2119,7 +2137,21 @@ const TIRE_COMPOUNDS = {
   hard:   { paceBonus: [-5, -1], wearMult: 0.7, label: 'Hard' },
 };
 
-function simulateRace(grid, playerDriver, qualyResults, track, weather, playerStrategy, difficulty, playerMorale, playerPaceBonus, trackTemp){
+/* aiStrategyOverrides (Pass 25, Team Ownership Mode full closure): an
+   OPTIONAL 11th parameter, a {driverId: {approach, compound}} map. Every
+   existing call site that omits it (every one before this pass) behaves
+   BYTE-FOR-BYTE identically to before -- an undefined map makes every
+   lookup below fall through to the exact same falsy check the code
+   already had, so this is purely additive, not a rewrite of the sim's
+   player-vs-grid distinction. It generalizes the single
+   `drv.id==='player' && playerStrategy` gate (further down) to also match
+   an AI driver whose id is a key in this map, using THAT driver's own
+   strategy object in place of playerStrategy for their own raceScore
+   term -- letting an Owner Mode team principal make a real strategy call
+   for either of their two AI drivers without touching driverStrength(),
+   the pace/reliability formulas above this point, or any other driver's
+   math at all. */
+function simulateRace(grid, playerDriver, qualyResults, track, weather, playerStrategy, difficulty, playerMorale, playerPaceBonus, trackTemp, aiStrategyOverrides){
   const diff = difficulty || DIFFICULTY_SETTINGS.Standard;
   const all = [...grid, playerDriver];
   const byId = Object.fromEntries(all.map(d=>[d.id,d]));
@@ -2192,7 +2224,16 @@ function simulateRace(grid, playerDriver, qualyResults, track, weather, playerSt
     // A player's tire compound choice also scales this: Soft wears ~35%
     // faster (higher DNF risk), Hard ~30% slower (lower DNF risk).
     let tireWearMult = band ? band.tireWearMult : 1;
+    // Pass 25: an AI driver with an owner-assigned strategy override gets
+    // the SAME compound-wear treatment the player already gets, using
+    // their OWN compound choice, not the player's -- deliberately
+    // separate from the `drv.id==='player'` branch just below so the two
+    // can never cross-apply each other's compound.
+    const ownStrategy = drv.id==='player' ? playerStrategy : (aiStrategyOverrides && aiStrategyOverrides[drv.id]);
+    const ownCompoundKey = (ownStrategy && ownStrategy.compound) || 'medium';
+    const ownCompound = drv.id==='player' ? compound : (TIRE_COMPOUNDS[ownCompoundKey] || TIRE_COMPOUNDS.medium);
     if(drv.id==='player') tireWearMult *= compound.wearMult;
+    else if(ownStrategy) tireWearMult *= ownCompound.wearMult;
     // Tyre Whisperer archetype (REPUTATION_ARCHETYPES in data.js,
     // tyreManagement>=85): previously a display-only badge. A driver who's
     // genuinely mastered tyre management runs a little cooler on tyre-wear
@@ -2209,6 +2250,11 @@ function simulateRace(grid, playerDriver, qualyResults, track, weather, playerSt
     // pace-variance hook further down, right where push/attack/defend's own
     // approach bonus already lives, rather than duplicating logic here.
     if(drv.id==='player' && drv.drivingStyle==='Tyre Saver' && playerStrategy && playerStrategy.approach==='saveTires') tireWearMult *= 0.93;
+    // Pass 25: same Tyre Saver style bonus, generalized to an AI driver
+    // with an owner-assigned strategy override -- an AI driver CAN have
+    // earned a driving style too (recordStyleProgress() isn't
+    // player-exclusive), so this honors it exactly the same way.
+    else if(drv.id!=='player' && drv.drivingStyle==='Tyre Saver' && ownStrategy && ownStrategy.approach==='saveTires') tireWearMult *= 0.93;
     // Reliability gap from 100 is raised to a difficulty-scaled exponent
     // (>1 at Realistic, <1 at Casual) before scaling -- this widens the risk
     // gap between a strong car (safely near-0% regardless of difficulty) and
@@ -2271,6 +2317,25 @@ function simulateRace(grid, playerDriver, qualyResults, track, weather, playerSt
       // Tire compound pace effect -- applied on top of the approach's own
       // effect, same additive shape, zero effect at 'medium' (the default).
       raceScore += rand(compound.paceBonus[0], compound.paceBonus[1]);
+    } else if(drv.id!=='player' && ownStrategy){
+      // Pass 25 -- Team Ownership Mode full closure: the EXACT SAME
+      // approach/compound math the player's own branch above uses,
+      // applied to an AI driver with an owner-assigned strategy override
+      // (aiStrategyOverrides), using THAT driver's own ownStrategy/
+      // ownCompound rather than playerStrategy/compound. diff.tireForgiveness
+      // is deliberately NOT applied here (tireMult stays 1, matching what
+      // the player branch's own `drv.id==='player' ? diff.tireForgiveness : 1`
+      // ternary would already evaluate to for a non-player id) -- that
+      // difficulty-scaled forgiveness is specifically a player-experience
+      // knob, not something that should make an AI driver's own strategy
+      // call artificially safer than any other AI driver's un-chosen one.
+      if(ownStrategy.approach==='push') raceScore += rand(-4,10);
+      if(ownStrategy.approach==='saveTires') raceScore += rand(2,6);
+      if(ownStrategy.approach==='defend') raceScore += rand(0,4);
+      if(ownStrategy.approach==='attack') raceScore += rand(-6,14);
+      if(drv.drivingStyle==='Aggressive' && (ownStrategy.approach==='push' || ownStrategy.approach==='attack')) raceScore += rand(1,4);
+      if(drv.drivingStyle==='Defensive' && ownStrategy.approach==='defend') raceScore += rand(1,4);
+      raceScore += rand(ownCompound.paceBonus[0], ownCompound.paceBonus[1]);
     }
     return { driverId: drv.id, raceScore: dnf ? -9999 : raceScore, dnf };
   });
@@ -2562,6 +2627,14 @@ function makeProtege(state){
     name, nationality: nation, flag: FLAG_BY_NATION[nation],
     mentorProgress: 0, // 0-100, graduates at 100
     graduated: false,
+    // Feature idea #15 -- give each recruited prospect a personality,
+    // reusing the SAME 4-value personality system already used for
+    // engineers/journalists (ENGINEER_PERSONALITIES/pickPressInterviewer)
+    // rather than inventing a parallel one, so mentoring sessions
+    // (mentorProtege(), app_actions.js) have genuine flavor variance
+    // per prospect instead of identical text regardless of who's being
+    // mentored.
+    personality: pick(['Calm','Energetic','Strict','Funny']),
   };
 }
 
@@ -2664,9 +2737,83 @@ function processGridRetirements(state){
     retirees.forEach(r=>{
       const team = TEAMS.find(t=>t.id===r.teamId);
       pushStateNews(state, `🏁 ${r.name} announces retirement from ${team ? team.name : 'the grid'} at the end of the season.`);
+      // Feature idea #21 -- driver market news ticker. AI grid
+      // retirements were already generated here and already pushed to
+      // the news feed as a bare announcement, but with no follow-up --
+      // real retirements come with SOME sense of what's next. A second,
+      // immediate flavor headline surfaces a plausible next chapter,
+      // reusing the SAME pushStateNews()/newsFeed pipeline the
+      // retirement announcement itself just used, no new display system.
+      const nextChapter = pick(['moves into TV punditry', 'is rumored to be eyeing a team principal role', 'says they plan to step away from racing entirely for now', 'is linked with a simulator/reserve driver role', 'plans to focus on their junior racing academy']);
+      pushStateNews(state, `📰 What's next for ${r.name}? Paddock word is they ${nextChapter}.`);
     });
   }
   return retirees;
+}
+
+/* Driver market news ticker -- real AI-to-AI contract switching (closes
+   the "flavor-only, no real mechanic" backlog gap from Pass 23's initial
+   pass). Called once per season end, AFTER processGridRetirements() has
+   already settled retirements/replacements for the season, so a driver
+   who just retired can never also be picked to switch teams the same
+   season.
+
+   Deliberately a pure SWAP between two AI drivers on two DIFFERENT teams
+   (never involving the player or the player's own teammate, and never
+   touching grid size) rather than any add/remove/replace operation --
+   this keeps every grid invariant trivially intact by construction: the
+   grid array's length, id set, and per-team count of exactly 2 never
+   change, since it's the same two objects' teamId fields trading places.
+   This is intentionally simpler than rebalanceGridForTeamChange() (which
+   exists for a PLAYER switch and has to drop/add drivers to keep counts
+   right) -- a straight two-driver swap needs none of that machinery.
+
+   Small, rare (roughly 0-2 swaps most seasons), and purely narrative in
+   its game-mechanical weight: standings/constructorPoints already key off
+   drv.teamId AT THE MOMENT points were scored (see executeRace()'s own
+   comment on this), so a later teamId change here can never retroactively
+   rewrite a team's past points -- confirmed by the existing Constructors-
+   after-switch regression check (suite_pass21_test.js), which exercises
+   the exact same invariant for a PLAYER switch and applies identically
+   here. */
+function processDriverMarketMoves(state){
+  const p = state.player;
+  if(Math.random() > 0.35) return []; // most seasons: no AI driver market movement at all
+  const swapCount = Math.random() < 0.75 ? 1 : 2; // rare seasons see two moves instead of one
+  const moves = [];
+  const usedIds = new Set();
+  for(let i=0; i<swapCount; i++){
+    // Eligible pool: any AI grid driver NOT the player's own current
+    // teammate (that relationship arc is a separate, deliberately player-
+    // facing system -- see driver.teammateTally -- and shouldn't get
+    // silently reshuffled by this background system) and not already
+    // picked in this same season's earlier swap.
+    const eligible = state.grid.filter(d=>d.teamId!==p.teamId && !usedIds.has(d.id));
+    if(eligible.length < 2) break;
+    const driverA = pick(eligible);
+    const candidatesB = eligible.filter(d=>d.id!==driverA.id && d.teamId!==driverA.teamId);
+    if(!candidatesB.length) break;
+    const driverB = pick(candidatesB);
+    const teamAName = (TEAMS.find(t=>t.id===driverA.teamId)||{}).name || driverA.teamId;
+    const teamBName = (TEAMS.find(t=>t.id===driverB.teamId)||{}).name || driverB.teamId;
+    const tmp = driverA.teamId;
+    driverA.teamId = driverB.teamId;
+    driverB.teamId = tmp;
+    // A team switch resets the same "how long has this driver been here"
+    // signal the player's own joinedTeamOnSeason field tracks, so any
+    // future system reading it (none currently do for AI drivers, but
+    // this keeps the two driver shapes consistent) sees an honest value.
+    driverA.joinedTeamOnSeason = state.season;
+    driverB.joinedTeamOnSeason = state.season;
+    usedIds.add(driverA.id); usedIds.add(driverB.id);
+    moves.push({ driverAName: driverA.name, fromA: teamAName, toA: teamBName, driverBName: driverB.name, fromB: teamBName, toB: teamAName });
+  }
+  if(moves.length && state.newsFeed){
+    moves.forEach(m=>{
+      pushStateNews(state, `📰 Driver market: ${m.driverAName} moves from ${m.fromA} to ${m.toA}, with ${m.driverBName} making the reverse switch to ${m.toB}.`);
+    });
+  }
+  return moves;
 }
 
 /* ---------- Team staff (npcRoster) aging & retirement ----------
@@ -2766,6 +2913,17 @@ function processStaffTurnover(state, retireeCountThisSeason){
 function checkScoutingInterest(state){
   const s = state; const p = s.player;
   if(!p || p.retired) return null;
+  // Team Ownership Mode bugfix (Pass 25): this checks purely against
+  // p.contract/p.teamId/standings['player'], all of which still exist and
+  // update normally under Owner Mode (the player's own driver object
+  // still races and scores every weekend -- see autoResolveOwnerRaceWeekend(),
+  // app_race.js). With no gate here, an owner could receive an unsolicited
+  // "rival team wants to sign you" scouting offer, framed entirely as a
+  // DRIVER being poached -- a concept that doesn't apply to a team
+  // principal at all (nothing in this codebase models an owner being
+  // approached to run a DIFFERENT team). Gated out the same way other
+  // driver-only systems already are.
+  if(p.isTeamOwner) return null;
   if(s.scoutingOffer) return null; // don't stack multiple pending offers
   if(p.contract.years <= 1) return null; // let the normal renewal flow handle expiring contracts
 
@@ -3145,6 +3303,17 @@ const App = {
     if(p.simRacingRep===undefined) p.simRacingRep = 0;
     if(p.protegeRoster===undefined) p.protegeRoster = p.protege ? [p.protege] : [];
     if(p.releaseClauseUsedThisContract===undefined) p.releaseClauseUsedThisContract = false;
+    // Feature idea #15 -- backfill personality onto any protégé created
+    // before this feature existed (old saves), same defensive backward-
+    // compat pattern as every other field below.
+    (p.protegeRoster||[]).forEach(pr=>{
+      if(pr.personality===undefined) pr.personality = pick(['Calm','Energetic','Strict','Funny']);
+      // Individual academy arc (Pass 23 REMAINING BACKLOG closure) --
+      // backfill onto any prospect recruited before this feature existed.
+      if(pr.backstory===undefined) pr.backstory = pick(this.ACADEMY_PROSPECT_BACKSTORIES);
+      if(pr.milestonesSeen===undefined) pr.milestonesSeen = [];
+    });
+    if(p.protege && p.protege.personality===undefined) p.protege.personality = pick(['Calm','Energetic','Strict','Funny']);
     if(s.grid){
       s.grid.forEach(d=>{
         if(d.contractMilestones===undefined) d.contractMilestones = null;
@@ -3231,6 +3400,21 @@ const App = {
     this.wireOptionGrid('grid-ownermode', v=>{ cfg.ownerMode = (v==='owner'); });
     document.getElementById('btn-start-career').onclick = ()=>{
       if(!cfg.name || !cfg.name.trim()){ this.toast('Please enter a driver name.'); return; }
+      // Team Ownership Mode bugfix (Pass 25): "Choose Your Teammate" ("pick
+      // who partners YOU") is entirely driver-framed and doesn't apply to
+      // an owner at all -- the owner isn't racing, so there's no personal
+      // seat to have a teammate FOR. Previously this modal showed
+      // unconditionally regardless of cfg.ownerMode, forcing an owner
+      // through a "pick your teammate" flow with no teammate of their own.
+      // generateGrid() (engine.js) already handles teammateChoice:null
+      // correctly (falls back to the team's first named driver), so
+      // skipping the picker for owner mode needs no change on the grid-
+      // generation side at all -- purely a UX fix at the entry point.
+      if(cfg.ownerMode){
+        cfg.teammateChoice = null;
+        this.startNewCareer();
+        return;
+      }
       this.renderTeammatePickModal({
         teamId: cfg.teamId,
         mode: 'newCareer',
@@ -3263,6 +3447,15 @@ const App = {
     this._prologueState = { round: 0, totalRounds: 3, correctTotal: 0, questionTotal: 0 };
     this.renderJuniorSeriesIntro();
   },
+  /* Feature idea #10 -- seed the player's very first grid rival from one of
+     the prologue's quiz-flavor "opponents", giving the origin story a tie
+     back to the prologue instead of a cold-start rivalry (updateRivalry(),
+     app_race.js, would otherwise only build one up organically race by
+     race with no starting narrative). One flavor name per prologue round --
+     purely a name/origin-text pool, not a new driver-generation system. */
+  JUNIOR_SERIES_OPPONENTS: [
+    'Theo Marchetti', 'Ines Kovac', 'Rafael Duarte',
+  ],
   renderJuniorSeriesIntro(){
     this.root.innerHTML = `
       <div class="create-wrap" style="text-align:center;">
@@ -3280,15 +3473,21 @@ const App = {
     const ps = this._prologueState;
     const rounds = ['Junior Series Round 1', 'Junior Series Round 2', 'Junior Series Finale'];
     const themes = ['setup','tires','strategy'];
+    const opponent = this.JUNIOR_SERIES_OPPONENTS[ps.round % this.JUNIOR_SERIES_OPPONENTS.length];
     this.startQuizMiniGame({
       title: rounds[ps.round],
-      subtitle: 'Prove yourself before F1',
+      subtitle: `Head-to-head with ${opponent} before F1`,
       theme: themes[ps.round % themes.length],
       questionCount: 3,
       trackId: null,
       onComplete: (scorePct)=>{
         ps.correctTotal += Math.round(scorePct*3);
         ps.questionTotal += 3;
+        // Track how the player did specifically against the LAST round's
+        // opponent -- the finale opponent becomes the seeded rival below,
+        // so only that round's own performance matters for the origin text.
+        ps.lastOpponent = opponent;
+        ps.lastOpponentScorePct = scorePct;
         ps.round++;
         if(ps.round < ps.totalRounds){
           this.runJuniorSeriesRound();
@@ -3326,6 +3525,30 @@ const App = {
         : 'A rocky junior series, but everyone has to start somewhere.';
       p.journal.unshift({season:s.season, week:s.week, title:'Junior Series Complete', text:`${Math.round(overallPct*100)}% (${ps.correctTotal}/${ps.questionTotal}) — ${line}`, icon:'🏁'});
       this.toast(`🏁 Junior Series complete: ${Math.round(overallPct*100)}%.`);
+      // Feature idea #10 -- seed the player's first rival from the
+      // prologue's finale opponent. Picks a real grid driver (not the
+      // player's own teammate, so the origin rivalry isn't confused with
+      // the separate teammate relationship arc) and renames them to match
+      // the finale opponent's flavor name, with a small starting
+      // rivalryLevel and a dedicated origin line -- a genuine narrative
+      // head start rather than the fully cold-start rivalry
+      // updateRivalry() would otherwise build up race by race with no
+      // tie-in at all. Only fires when the finale was actually played
+      // (ps.lastOpponent set) and there's a non-teammate grid driver to
+      // attach it to.
+      if(ps.lastOpponent){
+        const candidate = s.grid.find(d=>d.teamId!==p.teamId);
+        if(candidate){
+          candidate.name = ps.lastOpponent;
+          const closeFinale = ps.lastOpponentScorePct!==undefined && ps.lastOpponentScorePct < 0.6;
+          candidate.rivalryLevel = clamp((candidate.rivalryLevel||0) + (closeFinale ? 26 : 22), 0, 100);
+          candidate.rivalryOrigin = closeFinale
+            ? `${ps.lastOpponent} narrowly got the better of you in the junior series finale — a rivalry born before F1 even started.`
+            : `You and ${ps.lastOpponent} were the two names to watch in the junior series — old habits die hard.`;
+          s.rivalId = candidate.id;
+          p.journal.unshift({season:s.season, week:s.week, title:'A Familiar Face', text:`${ps.lastOpponent} — your junior series finale opponent — has made the grid too. The rivalry continues in F1.`, icon:'⚔️'});
+        }
+      }
     }
     this._prologueState = null;
     this.saveState();
@@ -3785,7 +4008,7 @@ const App = {
   rerenderCurrentScreen(){
     if(this.currentScreen==='hub') this.renderHub();
     else if(this.currentScreen==='race') this.renderRaceCenterScreen();
-    else if(this.currentScreen==='team') this.renderTeamScreen();
+    else if(this.currentScreen==='team') { this.state.player.isTeamOwner ? this.renderOwnerHQScreen() : this.renderTeamScreen(); }
     else this.renderHub();
   },
 };
@@ -3890,7 +4113,7 @@ Object.assign(App, {
     if(action==='social') return this.renderRelationshipsModal();
     if(action==='media') return this.renderMediaModal();
     if(action==='sponsors') return this.renderSponsorsModal();
-    if(action==='team') return this.renderTeamScreen();
+    if(action==='team') return this.state.player.isTeamOwner ? this.renderOwnerHQScreen() : this.renderTeamScreen();
     if(action==='mentor') return this.renderMentorModal();
   },
 
@@ -4090,6 +4313,7 @@ Object.assign(App, {
               <div style="font-weight:800;">${pr.flag} ${pr.name} ${isActive?'<span class="chip gold">Active</span>':''}</div>
               ${!isActive?`<button class="pbtn small" data-set-active="${pr._academyId}">Make Active</button>`:''}
             </div>
+            ${pr.backstory ? `<div class="section-sub" style="margin-top:2px; font-style:italic;">${pr.backstory}${pr.personality ? ` · ${pr.personality}` : ''}</div>` : ''}
             ${this.renderPixelBar(pr.mentorProgress,'confidence')}
             <div class="section-sub" style="margin-top:4px;">${pr.mentorProgress}/100${isActive?'':' (bench — grows slowly without active sessions)'}</div>
             <button class="pbtn small" data-dismiss-protege="${pr._academyId}" style="margin-top:6px; color:#a33;">Release from Academy</button>
@@ -4129,16 +4353,39 @@ Object.assign(App, {
     });
   },
 
+  /* Feature idea #16 follow-up (Pass 23 REMAINING BACKLOG item, closed
+     this pass): each academy prospect now gets a genuine individual arc,
+     not just the shared latent-progress trickle + personality Pass 23's
+     first pass added. Two pieces:
+       1. A one-time BACKSTORY line rolled at recruitment (below), giving
+          the player something to read and get attached to immediately,
+          before a single mentoring session has happened.
+       2. Milestone journal beats at 25/50/75 progress (see mentorProtege()
+          below), fired via pr.milestonesSeen so each prospect's own
+          progress narrative is distinct and never repeats.
+     Both are pure flavor text -- no new mechanical effect on
+     mentorProgress itself, same spirit as every other narrative-only
+     addition in this pass. */
+  ACADEMY_PROSPECT_BACKSTORIES: [
+    'came up through local karting, self-funded the whole way',
+    'was scouted out of a junior single-seater series after a string of podiums',
+    'grew up around the paddock — a parent worked as a mechanic for years',
+    'walked away from another academy after a personality clash with their old mentor',
+    'is the first in their family to ever sit in a race car',
+    'built a reputation on social media long before any team noticed the talent behind it',
+  ],
   recruitAcademyProspect(){
     const s = this.state; const p = s.player;
     if(!p.protegeRoster) p.protegeRoster = [];
     if(p.protegeRoster.length >= this.ACADEMY_MAX_SIZE){ this.toast('Academy roster is full.'); return; }
     const newProspect = makeProtege(s);
     newProspect._academyId = uid('academy');
+    newProspect.backstory = pick(this.ACADEMY_PROSPECT_BACKSTORIES);
+    newProspect.milestonesSeen = [];
     p.protegeRoster.push(newProspect);
     if(!p.protege) p.protege = newProspect; // first recruit (or first after the active one graduated/left) becomes active automatically
     this.toast(`🌟 ${newProspect.name} joins the academy!`);
-    p.journal.unshift({season:s.season, week:s.week, title:'New Academy Prospect', text:`Recruited ${newProspect.name} to the driver academy.`, icon:'🌟'});
+    p.journal.unshift({season:s.season, week:s.week, title:'New Academy Prospect', text:`Recruited ${newProspect.name} to the driver academy — ${newProspect.backstory}.`, icon:'🌟'});
     this.closeModal();
     this.saveState();
     this.showFirstTimeExplainer('seenMentorExplainer', '🎓', 'Driver Academy',
@@ -4146,6 +4393,25 @@ Object.assign(App, {
       ()=> this.rerenderCurrentScreen());
   },
 
+  /* Feature idea #15 -- mentoring session flavor variance per prospect
+     personality (set on makeProtege(), engine.js). Small, local flavor
+     pool -- not routed through radioLine()/RADIO_LINES, since those are
+     specifically race-radio-voiced and category-keyed in a way that
+     doesn't fit a mentoring debrief line; same 4-key personality shape,
+     separate small bank. Falls back to a personality-neutral line for any
+     protégé created before this feature existed (backward compat, same
+     defensive pattern as other new-field additions in this pass). */
+  MENTOR_SESSION_LINES: {
+    Calm:["stayed composed and asked good questions.", "took the feedback in stride, nice and steady."],
+    Energetic:["was buzzing with questions the whole session!", "couldn't wait to try out what you showed them."],
+    Strict:["wanted everything by the book, no shortcuts.", "took detailed notes on every point you made."],
+    Funny:["cracked a few jokes but still soaked it all in.", "kept things light while clearly paying attention."],
+  },
+  mentorSessionFlavor(pr){
+    const bank = this.MENTOR_SESSION_LINES[pr.personality] || null;
+    if(!bank) return `${pr.name} put in solid work this session.`;
+    return `${pr.name} ${pick(bank)}`;
+  },
   mentorProtege(){
     const s = this.state; const p = s.player; const pr = p.protege;
     if(!pr || pr.graduated) return;
@@ -4168,6 +4434,29 @@ Object.assign(App, {
     // A little of the mentoring warmth rubs off on the player too -- keeps
     // this from feeling like a pure investment with zero personal payoff.
     p.attributes.lifestyle.mood = clamp(p.attributes.lifestyle.mood + 3);
+    const flavorLine = this.mentorSessionFlavor(pr);
+    // Individual academy arc milestone beats (Pass 23 REMAINING BACKLOG
+    // closure) -- fires at most once per threshold per prospect, tracked
+    // in pr.milestonesSeen so re-crossing (impossible here since progress
+    // only goes up, but matches the fire-once pattern used everywhere
+    // else in this codebase) can never double-fire. Distinct text per
+    // personality so two prospects hitting the same threshold don't read
+    // identically.
+    if(!pr.milestonesSeen) pr.milestonesSeen = [];
+    const MILESTONE_LINES = {
+      25: { Calm:'is settling in well, calm and unhurried in every session.', Energetic:'is soaking up every minute of track time, buzzing with enthusiasm.', Strict:'has already memorized the whole training program by heart.', Funny:'has become the life of the garage, even this early on.' },
+      50: { Calm:'is halfway there, and it shows in how composed they\'ve become.', Energetic:'is halfway to graduation and still hungry for more.', Strict:'is halfway through the program, disciplined as ever.', Funny:'is halfway there — still cracking jokes, but clearly improving fast.' },
+      75: { Calm:'is nearly ready, radiating quiet confidence.', Energetic:'is nearly ready and can barely contain the excitement.', Strict:'is nearly ready, having left nothing to chance.', Funny:'is nearly ready — the jokes haven\'t stopped, but neither has the progress.' },
+    };
+    [25,50,75].forEach(threshold=>{
+      const key = `${pr._academyId}_${threshold}`;
+      if(pr.mentorProgress>=threshold && !pr.milestonesSeen.includes(key)){
+        pr.milestonesSeen.push(key);
+        const bank = MILESTONE_LINES[threshold];
+        const line = (bank && bank[pr.personality]) || `has reached ${threshold}% mentorship progress.`;
+        p.journal.unshift({season:s.season, week:s.week, title:`${pr.name} — Progress Check`, text:`${pr.name} ${line}`, icon:'📈'});
+      }
+    });
     if(pr.mentorProgress>=100 && !pr.graduated){
       pr.graduated = true;
       this.toast(`🌟 ${pr.name} is fully mentored and ready for a grid seat!`);
@@ -4179,7 +4468,7 @@ Object.assign(App, {
       // spirit as other auto-advance points in this file.
       p.protege = (p.protegeRoster||[]).find(other=>!other.graduated && other._academyId!==pr._academyId) || null;
     } else {
-      this.toast(`🎓 Good session with ${pr.name}. Progress +${gain} (${pr.mentorProgress}/100).`);
+      this.toast(`🎓 ${flavorLine} Progress +${gain} (${pr.mentorProgress}/100).`);
     }
     this.closeModal();
     this.saveState();
@@ -4265,7 +4554,15 @@ Object.assign(App, {
         this.pushNews(`🕹️ ${p.name} — ${t.text}`);
       }
     });
-    this.toast(`🕹️ Sim Racing — nice session! +${reactionGain} Reaction, +${repGain} Sim Rep (${p.simRacingRep}).${unlockLine?' '+unlockLine:''}`);
+    // Feature idea #4 -- fake deterministic-per-seed leaderboard flavor
+    // line, layered onto the existing simRacingRep display. No real
+    // multiplayer/leaderboard system, no new state beyond simRacingRep
+    // itself (already tracked) -- the "rank" is derived fresh each time
+    // from the current rep value via a fixed, non-persisted formula, so it
+    // moves consistently with rep without needing to be stored anywhere.
+    const simRank = Math.max(1, Math.round(500 / (1 + p.simRacingRep)));
+    const rankLine = simRank<=10 ? ` You're currently the #${simRank} most-watched sim racer.` : simRank<=50 ? ` You're cracking the sim racing top 50 (#${simRank}).` : '';
+    this.toast(`🕹️ Sim Racing — nice session! +${reactionGain} Reaction, +${repGain} Sim Rep (${p.simRacingRep}).${unlockLine?' '+unlockLine:''}${rankLine}`);
     this.closeModal();
     this.saveState();
     this.rerenderCurrentScreen();
@@ -4890,9 +5187,46 @@ Object.assign(App, {
     { name:'Elena Ruiz', personality:'Strict', outlet:'The Paddock Report' },
     { name:'Marcus Webb', personality:'Funny', outlet:'Pit Lane Weekly' },
   ],
+  /* Feature idea #9 -- rival journalist. If a guest journalist's questions
+     get answered combatively (see the `combative:true` tag on specific
+     renderMediaModal() options above) enough times, that SAME guest becomes
+     a semi-recurring presence with their own small relationship track,
+     reusing the exact same {trust,friendship,memories} shape every other
+     NPC relationship already uses (s.npcRoster entries) rather than
+     inventing a new relationship shape. Tracked as s.guestCombativeCounts
+     (per guest name, small/transient) until one guest crosses the
+     threshold, at which point s.rivalJournalist is created once and never
+     re-rolled -- same "stable for the life of the relationship" spirit as
+     rollRivalryOrigin(). Once a rival journalist exists, pickPressInterviewer()
+     favors bringing them back specifically instead of a random guest, so
+     the "semi-recurring" framing actually plays out over time. */
+  RIVAL_JOURNALIST_THRESHOLD: 3,
+  recordCombativeAnswer(journalistName){
+    const s = this.state;
+    if(s.rivalJournalist) return; // already promoted -- nothing left to track
+    const guest = this.GUEST_JOURNALISTS.find(g=>g.name===journalistName);
+    if(!guest) return; // combative tracking only applies to guest interviewers, not the regular roster Journalist
+    if(!s.guestCombativeCounts) s.guestCombativeCounts = {};
+    s.guestCombativeCounts[journalistName] = (s.guestCombativeCounts[journalistName]||0) + 1;
+    if(s.guestCombativeCounts[journalistName] >= this.RIVAL_JOURNALIST_THRESHOLD){
+      s.rivalJournalist = {
+        name: guest.name, outlet: guest.outlet, personality: guest.personality,
+        relationship: { trust:20, friendship:15, memories:[] }, // starts low -- this relationship began adversarially
+      };
+      this.pushNews(`📰 ${guest.name} of ${guest.outlet} has become a recurring thorn in ${s.player.name}'s side at press conferences.`);
+      s.player.journal.unshift({season:s.season, week:s.week, title:'A Recurring Rival', text:`${guest.name} of ${guest.outlet} has clearly got it in for you after one too many combative exchanges — expect to see them again.`, icon:'📰'});
+    }
+  },
   pickPressInterviewer(){
     const s = this.state;
     const regular = s.npcRoster.find(n=>n.role==='Journalist');
+    // Once a rival journalist has been promoted (see recordCombativeAnswer
+    // above), they show up more often than an ordinary guest would --
+    // "semi-recurring", not universal -- while the regular roster
+    // Journalist still gets the majority share.
+    if(s.rivalJournalist && Math.random() < 0.4){
+      return { name: s.rivalJournalist.name, role: s.rivalJournalist.outlet, personality: s.rivalJournalist.personality, isGuest: true, isRivalJournalist: true, relationship: s.rivalJournalist.relationship };
+    }
     // ~25% of press conferences bring in a guest interviewer instead of the
     // regular beat journalist -- deliberately a minority share so the
     // regular journalist's built-up relationship/memories stay the primary,
@@ -4902,6 +5236,50 @@ Object.assign(App, {
       return { name: guest.name, role: guest.outlet, personality: guest.personality, isGuest: true, relationship: { memories: [] } };
     }
     return { ...regular, isGuest: false };
+  },
+
+  /* ---------------- WEEKEND MEDIA DAY (feature idea #19) ----------------
+     A dedicated pre-race screen, distinct from the existing press
+     conference (renderMediaModal() above, which fires as a normal daily
+     'media' action and is about the player's own narrative/relationships).
+     This is specifically sponsor-facing: a short round of photo/interview
+     obligations, offered on the Thursday of a race week (see
+     renderTodayActions(), app_hub.js), trading a little energy for direct
+     sponsor loyalty gains (sp._loyaltyBonusPts, checkSponsorObjectives()
+     above) -- giving sponsors day-to-day presence in the game beyond just
+     completing their goal objectives after a race. */
+  renderWeekendMediaDayModal(){
+    const s = this.state; const p = s.player;
+    if(!p.sponsors || !p.sponsors.length){
+      this.toast('No sponsors to do media obligations for yet.');
+      return;
+    }
+    const cost = 12;
+    if(p.attributes.lifestyle.energy < cost){ this.toast('Too tired for Weekend Media Day.'); return; }
+    const featured = [...p.sponsors].sort(()=>Math.random()-0.5).slice(0, Math.min(3, p.sponsors.length));
+    this.openModal(`
+      ${this.modalHeader('Weekend Media Day')}
+      <div class="section-sub" style="margin-bottom:10px;">A morning of sponsor photo shoots and quick interviews before the weekend gets underway. Costs ${cost} energy.</div>
+      <div class="stack-8">
+        ${featured.map(sp=>`<div class="pixel-panel" style="margin-bottom:0;"><div style="font-weight:800;">${sp.name}</div><div class="section-sub" style="margin:2px 0 0;">${sp.type}</div></div>`).join('')}
+      </div>
+      <button class="pbtn full gold" id="btn-run-media-day" style="margin-top:12px;">📸 Run Media Day</button>
+    `);
+    this.wireModalClose();
+    document.getElementById('btn-run-media-day').onclick = ()=>{
+      p.attributes.lifestyle.energy = clamp(p.attributes.lifestyle.energy - cost);
+      p.attributes.lifestyle.stress = clamp(p.attributes.lifestyle.stress + 4);
+      featured.forEach(sp=>{
+        sp._loyaltyBonusPts = clamp((sp._loyaltyBonusPts||0) + 0.03, 0, 0.4);
+      });
+      p._weekendMediaDayDoneThisWeekend = true;
+      const names = featured.map(sp=>sp.name).join(', ');
+      this.toast(`📸 Media Day complete — ${names} appreciate the time.`);
+      p.journal.unshift({season:s.season, week:s.week, title:'Weekend Media Day', text:`Spent the morning on sponsor obligations with ${names}, deepening those partnerships.`, icon:'📸'});
+      this.closeModal();
+      this.saveState();
+      this.renderHub();
+    };
   },
 
   renderMediaModal(){
@@ -4935,10 +5313,10 @@ Object.assign(App, {
       const reflectOptions = [
         {label:'Take full responsibility', effect:()=>{ rosterJournalist.relationship.trust=clamp(rosterJournalist.relationship.trust+4); }, result:'The press respects the accountability.', memory:'Took full responsibility for the last race result'},
         {label:'Focus on the positives', effect:()=>{ p.attributes.mental.confidence=clamp(p.attributes.mental.confidence+3); }, result:'A confident, upbeat spin.', memory:'Focused on the positives from the last race'},
-        {label:'Blame the car', effect:()=>{ this.adjustTeamMorale(p.teamId, -5); p.mediaReputation=clamp(p.mediaReputation-2,0,100); }, result:'The garage doesn\'t love hearing this.', memory:'Publicly blamed the car for the result'},
+        {label:'Blame the car', effect:()=>{ this.adjustTeamMorale(p.teamId, -5); p.mediaReputation=clamp(p.mediaReputation-2,0,100); }, result:'The garage doesn\'t love hearing this.', memory:'Publicly blamed the car for the result', combative:true},
       ];
       if(wasPoorResult && friendship<30){
-        reflectOptions.push({label:'Push back on the criticism', effect:()=>{ rosterJournalist.relationship.friendship=clamp(rosterJournalist.relationship.friendship-3); p.attributes.mental.pressure=clamp(p.attributes.mental.pressure+3); }, result:'Feisty response — not everyone will love it.', memory:'Pushed back hard against media criticism'});
+        reflectOptions.push({label:'Push back on the criticism', effect:()=>{ rosterJournalist.relationship.friendship=clamp(rosterJournalist.relationship.friendship-3); p.attributes.mental.pressure=clamp(p.attributes.mental.pressure+3); }, result:'Feisty response — not everyone will love it.', memory:'Pushed back hard against media criticism', combative:true});
       }
       pools.push({q:reflectQ, options:reflectOptions});
     }
@@ -4946,7 +5324,7 @@ Object.assign(App, {
     if(rival){
       pools.push({q:`${rival.name} has been getting the better of some battles lately — your response?`, options:[
         {label:'Respectful praise', effect:()=>{ rival.respect = clamp((rival.respect||50)+5); }, result:`${rival.name} appreciates the respect.`, memory:`Gave respectful praise to ${rival.name} in an interview`},
-        {label:'Fire back with confidence', effect:()=>{ p.attributes.mental.confidence=clamp(p.attributes.mental.confidence+4); rival.rivalryLevel=clamp((rival.rivalryLevel||0)+8,0,100); }, result:'Bold words — the rivalry heats up!', memory:`Fired back at ${rival.name} in the press`},
+        {label:'Fire back with confidence', effect:()=>{ p.attributes.mental.confidence=clamp(p.attributes.mental.confidence+4); rival.rivalryLevel=clamp((rival.rivalryLevel||0)+8,0,100); }, result:'Bold words — the rivalry heats up!', memory:`Fired back at ${rival.name} in the press`, combative:true},
         {label:'Downplay the rivalry', effect:()=>{}, result:'You keep things diplomatic.', memory:'Downplayed the rivalry with the press'},
       ]});
       pools.push({q:`Some fans are calling this the best rivalry on the grid right now. Thoughts on ${rival.name}?`, options:[
@@ -5000,7 +5378,7 @@ Object.assign(App, {
       const namesText = others.map(o=>o.name).join(' and ');
       pools.push({q:`With ${namesText} sat right here too — anything you want to say to ${others.length>1?'them':'them'} directly?`, options:[
         {label:'Speak directly to them, respectfully', effect:()=>{ others.forEach(o=>{ o.respect = clamp((o.respect||50)+4); }); }, result:`A classy, direct moment — ${namesText} respects it.`, memory:`Spoke directly to ${namesText} in a shared press conference`},
-        {label:'Needle them in front of the room', effect:()=>{ others.forEach(o=>{ o.rivalryLevel = clamp((o.rivalryLevel||0)+6,0,100); }); p.mediaReputation=clamp(p.mediaReputation-2,0,100); }, result:'The room goes quiet for a second — that\'s going to be the headline.', memory:`Needled ${namesText} in a shared press conference`},
+        {label:'Needle them in front of the room', effect:()=>{ others.forEach(o=>{ o.rivalryLevel = clamp((o.rivalryLevel||0)+6,0,100); }); p.mediaReputation=clamp(p.mediaReputation-2,0,100); }, result:'The room goes quiet for a second — that\'s going to be the headline.', memory:`Needled ${namesText} in a shared press conference`, combative:true},
         {label:'Stay focused on your own season', effect:()=>{ p.attributes.mental.focus=clamp(p.attributes.mental.focus+2); }, result:'Composed, professional — you don\'t take the bait.', memory:`Stayed focused despite ${namesText} being in the room`},
       ]});
     }
@@ -5031,7 +5409,7 @@ Object.assign(App, {
     const q = pick(pools);
     this.openModal(`
       ${this.modalHeader('Press Conference')}
-      <div class="section-sub" style="margin-bottom:8px;">${journalist.name} · ${journalist.isGuest ? journalist.role : 'Journalist'}${hasHistory ? ' · knows you well' : ''}</div>
+      <div class="section-sub" style="margin-bottom:8px;">${journalist.name} · ${journalist.isGuest ? journalist.role : 'Journalist'}${journalist.isRivalJournalist ? ' · has it in for you' : hasHistory ? ' · knows you well' : ''}</div>
       <div class="pixel-panel"><div style="font-weight:800;">"${q.q}"</div></div>
       <div class="stack-8">
         ${q.options.map((o,i)=>`<button class="pbtn full" data-opt="${i}">${o.label}</button>`).join('')}
@@ -5061,6 +5439,14 @@ Object.assign(App, {
         // "the press" building a paper trail with the player over time.
         rosterJournalist.relationship.memories.unshift({text:o.memory, season:s.season, week:s.week});
         if(rosterJournalist.relationship.memories.length>10) rosterJournalist.relationship.memories.pop();
+        // Feature idea #9 -- a combative answer given to a GUEST journalist
+        // (never the regular roster one, who already has their own
+        // long-term relationship track) counts toward that guest becoming
+        // a recurring rival journalist. No-op if this journalist wasn't a
+        // guest, or if a rival journalist already exists.
+        if(journalist.isGuest && !journalist.isRivalJournalist && o.combative){
+          this.recordCombativeAnswer(journalist.name);
+        }
         this.toast(o.result);
         this.closeModal();
         this.saveState();
@@ -5197,7 +5583,15 @@ Object.assign(App, {
       const seasonsWithSponsor = Math.max(0, (s.season - (sp.signedSeason||s.season)));
       const hospitalityLevel = this.state.facilities.hospitality||1;
       const loyaltyRatePerSeason = 0.04 + (hospitalityLevel-1)*0.005;
-      const loyaltyMult = 1 + clamp(seasonsWithSponsor * loyaltyRatePerSeason, 0, 0.4);
+      // Feature idea #19 -- Weekend Media Day photo/interview obligations
+      // (renderWeekendMediaDayModal() below) add directly to a sponsor's
+      // loyalty on top of the existing season-tenure loyalty above --
+      // sp._loyaltyBonusPts is a small additive percentage-points pool the
+      // player builds up day to day, separate from and stacked with the
+      // seasons-based rate, still folded into the SAME overall 40% cap so
+      // Weekend Media Day speeds up reaching that ceiling rather than
+      // creating a second uncapped bonus.
+      const loyaltyMult = 1 + clamp(seasonsWithSponsor * loyaltyRatePerSeason + (sp._loyaltyBonusPts||0), 0, 0.4);
       sp._loyaltyMult = Math.round(loyaltyMult*100)/100;
       recurringIncome += sp.pay*1.2*loyaltyMult;
 
@@ -5284,6 +5678,7 @@ Object.assign(App, {
       <div class="stack-8">
         <button class="pbtn full gold" id="btn-sponsor-lockin">🔒 Lock In Current Rate (+$${currentRate}M/race, guaranteed permanent)</button>
         <button class="pbtn full" id="btn-sponsor-gamble">🎲 Push for a Renegotiation (bigger upside, real risk of a setback)</button>
+        <button class="pbtn full" id="btn-sponsor-walkaway" style="background:var(--candy-red); color:#fff;">🚶 Walk Away (end the deal, one-time reputation boost)</button>
       </div>
     `);
     // Must-resolve: goalsCompleted is already at 10 and the sponsor is in a
@@ -5335,6 +5730,26 @@ Object.assign(App, {
       this.saveState();
       next();
     };
+    // Feature idea #12 -- "walk away" third choice. Ends the sponsorship
+    // outright (removed from p.sponsors entirely -- no lingering
+    // goalsCompleted/permanent state to confuse a later system) and grants
+    // a one-time reputation boost, framed as "growing beyond them" rather
+    // than a negative outcome -- the only one of the three choices that's
+    // purely upside on reputation, trading away the sponsor's ongoing pay
+    // to get it. Removes the entry from p.sponsors BEFORE shifting the
+    // pendingSponsorRenewals queue so a same-race double-fire on this exact
+    // sponsor is impossible (sp lookup by name would simply fail next time).
+    document.getElementById('btn-sponsor-walkaway').onclick = ()=>{
+      s.pendingSponsorRenewals.shift();
+      p.sponsors = p.sponsors.filter(x=>x.name!==sp.name);
+      p.mediaReputation = clamp(p.mediaReputation + 6, 0, 100);
+      this.toast(`🚶 You part ways with ${sp.name} — the paddock respects growing beyond them.`);
+      this.pushNews(`🚶 ${p.name} ends the partnership with ${sp.name}, choosing to grow beyond it.`);
+      p.journal.unshift({season:s.season, week:s.week, title:'Sponsor Parting', text:`Walked away from ${sp.name} after 10 completed goals together -- a clean break, +6 media reputation for growing beyond them.`, icon:'🚶'});
+      this.closeModal();
+      this.saveState();
+      next();
+    };
   },
 
 });
@@ -5363,6 +5778,16 @@ Object.assign(App, {
 
   driverSprite(p){
     return p.gender==='F' ? '👩‍🏎️' : '🧑‍🏎️';
+  },
+
+  /* Feature idea #18 -- livery/car colorway swatch, shown on the driver pod
+     (here) and the Race Center pod (app_race.js) so the purely-cosmetic
+     choice made in renderProfileModal() (app_screens.js) is actually
+     visible somewhere day to day, not just buried in a menu. */
+  colorwaySwatchIcon(p){
+    const id = p.carColorway || 'colorway_default';
+    const item = CAR_COLORWAY_POOL.find(c=>c.id===id);
+    return item ? item.icon : '🎨';
   },
 
   standingPosition(driverId){
@@ -5397,6 +5822,23 @@ Object.assign(App, {
       const teamDrivers = [...s.grid, s.player].filter(d=>d.teamId===team.id);
       return { team, points: cp[team.id]||0, drivers: teamDrivers };
     }).sort((a,b)=>b.points-a.points);
+  },
+
+  /* Feature idea #20 -- constructor rivalry. Tracks a "constructor rival"
+     team: whichever OTHER team is closest in Constructors' Championship
+     points to the player's own team, reusing constructorsStandings()'s
+     already-correct point totals rather than any new tracking. Purely a
+     read -- recomputed fresh every call, nothing persisted, so it always
+     reflects the CURRENT standings rather than going stale mid-season. */
+  getConstructorRival(){
+    const s = this.state;
+    const rows = this.constructorsStandings();
+    const myRow = rows.find(r=>r.team.id===s.player.teamId);
+    if(!myRow) return null;
+    const others = rows.filter(r=>r.team.id!==s.player.teamId);
+    if(!others.length) return null;
+    const closest = [...others].sort((a,b)=>Math.abs(a.points-myRow.points)-Math.abs(b.points-myRow.points))[0];
+    return { team: closest.team, points: closest.points, myPoints: myRow.points, gap: closest.points-myRow.points };
   },
 
   updateStatusStrip(){
@@ -5445,6 +5887,7 @@ Object.assign(App, {
         <div class="pod" id="pod-tap">
           <span class="pod-sprite">${this.driverSprite(p)}</span>
           <span class="pod-mood-badge">${this.moodEmoji(p.attributes.lifestyle.mood)}</span>
+          ${p.carColorway && p.carColorway!=='colorway_default' ? `<span class="pod-mood-badge" style="left:-4px; right:auto;" title="Car colorway">${this.colorwaySwatchIcon(p)}</span>` : ''}
         </div>
         <button id="pod-profile-btn" title="Driver Profile" style="position:absolute; right:calc(50% - 75px); bottom:2px; width:32px; height:32px; border-radius:50%; border:2px solid var(--pixel-border); background:var(--candy-yellow); font-size:14px; cursor:pointer; box-shadow:0 2px 0 var(--pixel-border);">🎨</button>
       </div>
@@ -5652,10 +6095,19 @@ Object.assign(App, {
       days.push({ d, temp:g.temp, icon: willBeRain ? '🌧️' : '☀️' });
     }
     const anyRain = days.some(x=>x.icon==='🌧️');
-    if(!anyRain) return ''; // only worth showing as a dedicated radar strip ahead of a wet weekend -- a plain dry run is already covered by the single chip above
+    // Feature idea #1 -- "track is rubbering in" flavor line: after several
+    // consecutive DRY weekends at this specific track (s.trackDryStreak,
+    // set in app_race.js finishExecuteRace()), layer a short flavor line
+    // onto this same strip on a dry forecast too, instead of only ever
+    // showing the strip ahead of a wet weekend. Pure flavor text -- doesn't
+    // touch weather/grip/tyre math anywhere.
+    const streak = (this.state.trackDryStreak||{})[track.id] || 0;
+    const rubberingLine = (!anyRain && streak>=3)
+      ? `<div class="chip mint" style="margin-top:4px;">🏁 Track is rubbering in — ${streak} dry sessions running here.</div>` : '';
+    if(!anyRain) return rubberingLine;
     return `<div class="chip blue" style="margin-top:4px; display:flex; gap:6px; align-items:center;">
       📻 Radar: ${days.map(x=>`${x.d===0?'Race':'D-'+x.d} ${x.icon}`).join(' → ')}
-    </div>`;
+    </div>${rubberingLine}`;
   },
 
   renderComingUpHooks(dayAct, round){
@@ -5703,7 +6155,16 @@ Object.assign(App, {
     if(s.player.isTeamOwner && dayAct){
       const label = dayAct==='practice' ? 'Run Practice (Auto)' : dayAct==='qualifying' ? (round.isSprint && !round.sprintCompleted ? 'Run Sprint Qualifying (Auto)' : round.isSprint ? 'Continue' : 'Run Qualifying (Auto)') : 'Run Race (Auto)';
       const alreadyDone = dayAct==='qualifying' && round.isSprint ? round.sprintCompleted : round.completed;
-      return `<p class="section-sub">🏗️ As team owner, you watch from the pit wall — this session resolves automatically.</p><button class="pbtn full gold" id="btn-owner-autoresolve" data-phase="${dayAct}" ${alreadyDone && dayAct!=='qualifying' ?'disabled':''}>${label}</button>`;
+      // Team Ownership Mode full closure (Pass 25) -- on race day only, an
+      // owner gets a REAL strategy call for each of their two AI drivers
+      // before the auto-resolve button, instead of both always silently
+      // defaulting to 'saveTires'/'medium'. Reuses simulateRace()'s new
+      // OPTIONAL aiStrategyOverrides parameter (engine.js) -- see
+      // renderOwnerStrategyModal() below.
+      const strategyChip = (dayAct==='race' && !round.completed)
+        ? `<button class="pbtn full ${s.player._ownerAiStrategy?'mint':''}" id="btn-owner-set-strategy" style="margin-bottom:10px;">📋 ${s.player._ownerAiStrategy?'Strategy Set — Review/Change':'Set Race Strategy for Your Drivers'}</button>`
+        : '';
+      return `${strategyChip}<p class="section-sub">🏗️ As team owner, you watch from the pit wall — this session resolves automatically.</p><button class="pbtn full gold" id="btn-owner-autoresolve" data-phase="${dayAct}" ${alreadyDone && dayAct!=='qualifying' ?'disabled':''}>${label}</button>`;
     }
     if(dayAct==='practice') return `<p class="section-sub">${round.isSprint?'🏃 Sprint Weekend practice — shorter track time than usual, so every lap counts before Sprint Qualifying.':'Free practice — dial in your setup before qualifying.'}</p><button class="pbtn full gold" id="btn-do-practice" ${round.completed?'disabled':''}>Run Practice</button>`;
     if(dayAct==='qualifying' && round.isSprint){
@@ -5713,6 +6174,33 @@ Object.assign(App, {
     }
     if(dayAct==='qualifying') return `<p class="section-sub">One lap. Everything on the line.</p><button class="pbtn full gold" id="btn-do-qualifying" ${round.completed?'disabled':''}>Start Qualifying</button>`;
     if(dayAct==='race') return `<p class="section-sub">${round.isSprint?'🏃 Sprint Weekend — ':''}Race day at ${this.getCurrentTrack().name}.</p><button class="pbtn full gold" id="btn-do-race" ${round.completed?'disabled':''}>Start Race</button>`;
+
+    // Feature idea #7 -- "Wet Setup" prep choice, offered specifically on
+    // the Thursday eve of a forecasted-wet race weekend (round.weather is
+    // locked in at calendar-build time, so it's already known this far
+    // ahead -- see buildSeasonCalendar(), engine.js). A one-shot chip, not
+    // part of the normal action grid below, since it's only relevant this
+    // one day of a wet race week.
+    const wetSetupChip = (this.dayName()==='Thursday' && round && !round.completed && round.weather==='rain' && !s.player._wetSetupChosen)
+      ? `<div class="pixel-panel" style="border-color:var(--candy-blue); margin-bottom:10px;">
+          <div class="section-sub" style="margin:0 0 6px;">🌧️ Rain is forecast for this weekend. Commit to a Wet Setup now? Trades a little dry-conditions pace for a bigger wet-conditions bonus if it actually rains.</div>
+          <button class="pbtn full" id="btn-wet-setup-choice">🌧️ Run Wet Setup This Weekend</button>
+        </div>`
+      : '';
+
+    // Feature idea #19 -- Weekend Media Day, offered on the Thursday of any
+    // race week (not just a wet one -- distinct trigger from the Wet Setup
+    // chip above, and the two can both appear the same Thursday) when the
+    // player has at least one sponsor and hasn't already run it this
+    // specific weekend (p._weekendMediaDayDoneThisWeekend, reset below by
+    // resetWeekendMediaDayFlag() the next time a new race weekend's
+    // Thursday comes around).
+    const mediaDayChip = (this.dayName()==='Thursday' && round && !round.completed && !s.player.isTeamOwner && s.player.sponsors && s.player.sponsors.length && !s.player._weekendMediaDayDoneThisWeekend)
+      ? `<div class="pixel-panel" style="border-color:var(--candy-yellow); margin-bottom:10px;">
+          <div class="section-sub" style="margin:0 0 6px;">📸 Your sponsors have asked for a morning of photos and quick interviews before the weekend begins.</div>
+          <button class="pbtn full" id="btn-weekend-media-day">📸 Run Weekend Media Day</button>
+        </div>`
+      : '';
 
     const actions = s.player.isTeamOwner ? [
       {id:'team', icon:'🏗️', label:'Team HQ'},
@@ -5733,7 +6221,7 @@ Object.assign(App, {
     // system (19.1 #6) per the handoff doc's own recommendation not to
     // invent a second, unrelated hook for the same number.
     if(s.player.homeLevel>=3 && !s.player.isTeamOwner) actions.push({id:'mentor', icon:'🌟', label:'Mentor'});
-    return `<div class="option-grid">
+    return `${wetSetupChip}${mediaDayChip}<div class="option-grid">
       ${actions.map(a=>`<button class="option-card" data-action="${a.id}" style="cursor:pointer;">${a.icon}<br>${a.label}</button>`).join('')}
     </div>
     <button class="pbtn full" id="btn-advance-day" style="margin-top:12px;">End Day →</button>`;
@@ -5746,6 +6234,14 @@ Object.assign(App, {
     if(byId('btn-do-sprint')) byId('btn-do-sprint').onclick = ()=> this.runSprintQualifying();
     if(byId('btn-do-race')) byId('btn-do-race').onclick = ()=> this.runRace();
     if(byId('btn-owner-autoresolve')) byId('btn-owner-autoresolve').onclick = ()=> this.autoResolveOwnerRaceWeekend(byId('btn-owner-autoresolve').dataset.phase);
+    if(byId('btn-owner-set-strategy')) byId('btn-owner-set-strategy').onclick = ()=> this.renderOwnerStrategyModal();
+    if(byId('btn-wet-setup-choice')) byId('btn-wet-setup-choice').onclick = ()=>{
+      this.state.player._wetSetupChosen = true;
+      this.toast('🌧️ Wet Setup locked in for this weekend.');
+      this.saveState();
+      this.renderHub();
+    };
+    if(byId('btn-weekend-media-day')) byId('btn-weekend-media-day').onclick = ()=> this.renderWeekendMediaDayModal();
     if(byId('btn-advance-day')) byId('btn-advance-day').onclick = ()=> this.advanceDay();
     if(byId('btn-season-wrap')) byId('btn-season-wrap').onclick = ()=> this.handleSeasonEnd();
     if(byId('btn-open-stats')) byId('btn-open-stats').onclick = ()=> this.renderCareerStatsModal();
@@ -5777,7 +6273,7 @@ Object.assign(App, {
     if(nav==='home') this.renderHub();
     else if(nav==='race') this.renderRaceCenterScreen();
     else if(nav==='training') this.openActionModal('training');
-    else if(nav==='team') this.showFirstTimeExplainer('seenDevSlotsExplainer', '🔧', 'Car Development', "Each season you get a limited number of dev slots — spend them on upgrades wisely. Higher Engineering facility levels mean more slots, and they reset fresh every new season.", ()=> this.renderTeamScreen());
+    else if(nav==='team') this.showFirstTimeExplainer('seenDevSlotsExplainer', '🔧', 'Car Development', "Each season you get a limited number of dev slots — spend them on upgrades wisely. Higher Engineering facility levels mean more slots, and they reset fresh every new season.", ()=> this.state.player.isTeamOwner ? this.renderOwnerHQScreen() : this.renderTeamScreen());
     else if(nav==='social') this.renderRelationshipsModal();
     else if(nav==='career') this.renderCareerStatsModal();
   },
@@ -5821,10 +6317,38 @@ Object.assign(App, {
       this.decayRelationships();
     }
     checkScoutingInterest(s);
+    // Feature idea #21 -- driver market news ticker: surfaces OTHER
+    // drivers' contract-rumor flavor as an occasional news item,
+    // independent of the player's own checkScoutingInterest() roll above.
+    // Low weekly chance, and specifically about the player's own rival
+    // (when one exists) so it reads as relevant paddock chatter rather
+    // than random noise about an unnamed AI driver.
+    this.maybeRollDriverMarketRumor();
     this.saveState();
     this.renderHub();
     if(celebRolled) this.showFirstTimeExplainer('seenCelebrityExplainer', '🌟', 'Celebrity Encounter', "As fame grows, you'll cross paths with celebrities. Handle it well and fan popularity goes up, though there's a small chance of a tabloid rumor too.", ()=> this.renderCelebrityEncounterModal(celebRolled));
     else if(controversyRolled) this.renderControversyModal(controversyRolled);
+  },
+
+  /* Feature idea #21 -- driver market news ticker (rival-focused variant).
+     A small, independent, low-probability roll for flavor-only contract
+     rumor news about the player's own rival (getRival(), app_race.js) --
+     purely a news-feed item via the same pushNews()/newsFeed pipeline
+     everything else uses, no mechanical effect and no interaction with
+     the real checkScoutingInterest()/processGridRetirements() systems. */
+  maybeRollDriverMarketRumor(){
+    const s = this.state;
+    if(Math.random() > 0.04) return; // rare -- occasional paddock chatter, not a weekly fixture
+    const rival = this.getRival ? this.getRival() : null;
+    if(!rival) return;
+    const team = TEAMS.find(t=>t.id===rival.teamId);
+    const rumors = [
+      `is reportedly happy at ${team?team.name:'their current team'} and unlikely to move any time soon`,
+      `has been the subject of quiet contract extension talks with ${team?team.name:'their team'}`,
+      `is being linked with a rival team by paddock insiders, though nothing appears imminent`,
+      `'s management has been spotted talking with more than one team principal this week`,
+    ];
+    this.pushNews(`📰 Driver market: ${rival.name} ${pick(rumors)}.`);
   },
 
   /* Same shape as maybeTriggerCelebrityEncounter above: returns the rolled
@@ -6012,9 +6536,10 @@ Object.assign(App, {
       : '';
 
     this.root.innerHTML = `
-      <div class="pod-wrap" style="margin-bottom:6px;">
+      <div class="pod-wrap" style="margin-bottom:6px; position:relative;">
         <div class="pod" style="width:96px; height:96px;">
           <span class="pod-sprite" style="font-size:40px;">🏎️</span>
+          ${s.player.carColorway && s.player.carColorway!=='colorway_default' ? `<span class="pod-mood-badge" title="Car colorway">${this.colorwaySwatchIcon(s.player)}</span>` : ''}
         </div>
       </div>
       <div class="pixel-panel">
@@ -6027,6 +6552,19 @@ Object.assign(App, {
         <div class="section-sub" style="margin:4px 0 0;">${this.overtakeTier(track.overtakeDiff).note}</div>
       </div>
       ${!isHomeTrack(s, track.id) && this.trackFamiliarity(track.id)>=75 ? `<div class="section-sub" style="margin:-2px 0 8px; text-align:center;">A few more visits here and this becomes a Home Track (85%+ familiarity).</div>` : ''}
+
+      ${(()=>{
+        // Feature idea #20 -- constructor rivalry flavor beat at race
+        // weekends. Only shown when the gap is close enough to actually
+        // read as a genuine fight (within 15 points either way) --
+        // otherwise this would fire every single weekend regardless of
+        // how the championship battle is actually going, which reads as
+        // noise rather than a real rivalry beat.
+        const cr = this.getConstructorRival();
+        if(!cr || Math.abs(cr.gap) > 15) return '';
+        const aheadText = cr.gap > 0 ? `trail ${cr.team.name} by ${cr.gap} point${cr.gap===1?'':'s'}` : cr.gap < 0 ? `lead ${cr.team.name} by ${-cr.gap} point${-cr.gap===1?'':'s'}` : `are tied with ${cr.team.name}`;
+        return `<div class="chip gold" style="margin:-2px 0 8px; display:block; text-align:center;">🏆 Constructors' battle: you ${aheadText} this weekend.</div>`;
+      })()}
 
       <div class="pixel-panel" style="border-left:3px solid ${isRain?'var(--candy-blue)':band.label==='Hot'?'var(--candy-red)':band.label==='Cold'?'var(--candy-blue)':'var(--candy-mint)'};">
         <div class="panel-title">Weekend Forecast</div>
@@ -6056,7 +6594,7 @@ Object.assign(App, {
      is a genuine "rough idea", not a guarantee -- same "presentational,
      doesn't touch the real sim" spirit as plausibleLapTime()/
      paceModifierBreakdown(). */
-  renderSimulatorPreviewModal(track, round){
+  renderSimulatorPreviewModal(track, round, fromPractice){
     const s = this.state; const p = s.player;
     const cost = 10;
     if(p.attributes.lifestyle.energy < cost){ this.toast('Too tired for a simulator session.'); return; }
@@ -6077,13 +6615,30 @@ Object.assign(App, {
     const paceBonus = setupBonus + cosmeticPaceBonus(this.getCosmeticBonuses());
     const previewResults = simulateQualifying(s.grid, previewPlayer, track, round.weather, paceBonus, round.trackTemp);
     const previewPos = previewResults.find(r=>r.driverId==='player').position;
+    // Feature idea #13 -- extend the qualifying-only preview to also
+    // preview a full race outcome. Reuses the EXACT same throwaway,
+    // non-persisting simulateRace() call approach the qualifying preview
+    // above already uses -- same previewPlayer snapshot, same paceBonus,
+    // fed through the just-computed previewResults as the starting grid
+    // (a genuine qualifying-to-race chain, same as the real weekend flow),
+    // with a generic 'push'/'medium' strategy assumption since there's no
+    // real strategy prompt at preview time. Thrown away immediately after
+    // -- doesn't touch s.lastQualyResults or anything else the real
+    // weekend reads.
+    const previewRaceResults = simulateRace(s.grid, previewPlayer, previewResults, track, round.weather, {approach:'push', compound:'medium'}, getDifficultySettings(s), this.getTeamMorale(p.teamId), paceBonus, round.trackTemp);
+    const previewRacePlayerResult = previewRaceResults.find(r=>r.driverId==='player');
+    const previewRacePos = previewRacePlayerResult && !previewRacePlayerResult.dnf ? previewRacePlayerResult.position : null;
     this.toast(`🖥️ Simulator session complete.`);
     this.openModal(`
       ${this.modalHeader('Simulator Preview')}
-      <div class="section-sub" style="margin:0 0 10px;">A rough look at how this weekend might go at your CURRENT stats and setup — not a guarantee. The real session will roll its own outcome.</div>
+      <div class="section-sub" style="margin:0 0 10px;">A rough look at how this weekend might go at your CURRENT stats and setup — not a guarantee. The real sessions will roll their own outcomes.</div>
       <div class="pixel-panel" style="text-align:center;">
         <div class="section-sub" style="margin-bottom:2px;">Projected qualifying</div>
         <div style="font-family:var(--font-pixel); font-size:28px; color:${previewPos<=3?'var(--candy-yellow)':'var(--ink)'};">~P${previewPos}</div>
+      </div>
+      <div class="pixel-panel" style="text-align:center; margin-top:8px;">
+        <div class="section-sub" style="margin-bottom:2px;">Projected race (assuming a Push strategy)</div>
+        <div style="font-family:var(--font-pixel); font-size:28px; color:${previewRacePos && previewRacePos<=3?'var(--candy-yellow)':'var(--ink)'};">${previewRacePos ? '~P'+previewRacePos : '~DNF'}</div>
       </div>
       <div class="section-sub" style="margin-top:8px;">${setupBonus>0.5 ? 'Your current setup looks like a good match for this track.' : setupBonus<-0.5 ? 'Your current setup looks off for this track — consider adjusting before qualifying.' : 'Your current setup looks roughly neutral for this track.'}</div>
       <button class="pbtn full gold" id="btn-sim-preview-done" style="margin-top:12px;">Got it</button>
@@ -6092,7 +6647,12 @@ Object.assign(App, {
     document.getElementById('btn-sim-preview-done').onclick = ()=>{
       this.closeModal();
       this.saveState();
-      this.renderRaceCenterScreen();
+      // Feature idea #16 -- when this preview was launched for free from
+      // the Qualifying Simulation practice program (fromPractice=true),
+      // "Got it" should finish that same day-advance the practice quiz
+      // would otherwise have gone straight to, not detour to Race Center.
+      if(fromPractice) this.advanceDay();
+      else this.renderRaceCenterScreen();
     };
     this.saveState();
   },
@@ -6230,6 +6790,16 @@ Object.assign(App, {
     { id:'setup', label:'Setup Focus', icon:'🔧', theme:'setup', familiarityMult:1.0, statBonus:null, desc:'Standard familiarity gain. No extra stat nudge.' },
     { id:'tire', label:'Tire Focus', icon:'🛞', theme:'tires', familiarityMult:0.8, statBonus:{group:'driving', stat:'tyreManagement', amount:1}, desc:'Slightly slower familiarity gain, but a small permanent Tyre Management nudge.' },
     { id:'traffic', label:'Traffic Focus', icon:'🚦', theme:'strategy', familiarityMult:0.8, statBonus:{group:'driving', stat:'overtaking', amount:1}, desc:'Slightly slower familiarity gain, but a small permanent Overtaking nudge.' },
+    // Feature idea #16 -- a 4th "Qualifying Simulation" program, specifically
+    // prepping for Saturday and tying practice programs together with the
+    // Simulator what-if mode (feature idea #13, renderSimulatorPreviewModal
+    // above) into one coherent pre-race prep loop: same reduced
+    // familiarityMult trade-off shape as Tire/Traffic Focus (a genuine
+    // trade, not a strictly-better 4th option), no stat nudge, but flags
+    // isQualSim so runPracticeQuiz's onComplete can offer a free Simulator
+    // preview session immediately afterward instead of the player needing
+    // to separately spend energy finding it.
+    { id:'qualsim', label:'Qualifying Simulation', icon:'🖥️', theme:'strategy', familiarityMult:0.8, statBonus:null, isQualSim:true, desc:'Slightly slower familiarity gain, but offers a free Simulator preview session right after.' },
   ],
 
   renderPracticeProgramModal(track, round){
@@ -6306,6 +6876,19 @@ Object.assign(App, {
           }
         }
         this.saveState();
+        // Feature idea #16 -- Qualifying Simulation program offers a free
+        // Simulator preview session immediately after (renderSimulatorPreviewModal,
+        // reuses the SAME preview function feature idea #13 extended --
+        // no separate preview logic here), skipping its usual energy cost
+        // since the player already paid the practice program's own
+        // familiarityMult trade-off for this. Only offered when there's
+        // enough energy left for it to actually run at all.
+        if(program.isQualSim && p.attributes.lifestyle.energy >= 0){
+          const priorEnergy = p.attributes.lifestyle.energy;
+          p.attributes.lifestyle.energy = clamp(priorEnergy + 10); // temporarily refund the preview's normal cost so this specific session is free, exactly once
+          this.renderSimulatorPreviewModal(track, round, true);
+          return;
+        }
         this.advanceDay();
       },
     });
@@ -6674,7 +7257,25 @@ Object.assign(App, {
     const weather = round.weather;
     const trackTemp = round.trackTemp;
     const qualy = round.sprintQualyResults;
-    const results = simulateRace(s.grid, p, qualy, track, weather, {approach: approach||'push'}, getDifficultySettings(s), this.getTeamMorale(p.teamId), 0, trackTemp);
+    // Home Track bonus (Pass 23, feature idea #14) -- made explicit here
+    // too, same reasoning as executeRace(): sprint qualifying already sets
+    // p.isHomeTrackBonus on the same player object driverStrength() reads,
+    // so this was already applying correctly as a side effect, just never
+    // set explicitly on this exact line and never disclosed. Backlog item
+    // closed (Pass 23 REMAINING BACKLOG note): sprint races now get the
+    // same explicit set + disclosed chip treatment the main race got.
+    p.isHomeTrackBonus = isHomeTrack(s, track.id) ? HOME_TRACK_PACE_BONUS : 0;
+    const homeTrackBonusAppliedThisSprint = p.isHomeTrackBonus > 0;
+    // Team Ownership Mode full closure (Pass 25) -- same owner-assigned AI
+    // strategy override executeRace() reads, applied here too so a sprint
+    // weekend's Saturday sprint honors the SAME weekend-long strategy call
+    // as Sunday's main race. Deliberately NOT cleared here (only
+    // executeRace() clears it) -- a sprint weekend has sprint-qualy ->
+    // sprint-race -> main-qualy -> main-race all in one weekend, and the
+    // owner's one strategy choice should hold across all of it, not get
+    // silently consumed after just the sprint.
+    const aiStrategyOverrides = p._ownerAiStrategy || undefined;
+    const results = simulateRace(s.grid, p, qualy, track, weather, {approach: approach||'push'}, getDifficultySettings(s), this.getTeamMorale(p.teamId), 0, trackTemp, aiStrategyOverrides);
     // Multi-weekend mechanical-failure consequence chain (engine.js): a
     // sprint DNF is a real mechanical failure too -- previously only the
     // main Sunday race could set/read this, so a Saturday sprint DNF
@@ -6733,6 +7334,7 @@ Object.assign(App, {
     this.openModal(`
       ${this.modalHeader('Sprint Result')}
       ${playerHadSprintMechanicalDNF ? `<div class="chip red" style="margin-bottom:8px; display:block;">🔧 That failure leaves the car a little fragile — reliability risk is elevated for Sunday's race unless it's addressed at Team &amp; Car.</div>` : ''}
+      ${homeTrackBonusAppliedThisSprint ? `<div class="chip mint" style="margin-bottom:8px; display:block;">🏠 Home Track boost — the crowd's energy gave you a small race-day pace bonus for the Sprint too.</div>` : ''}
       <div class="pixel-panel" style="text-align:center;">
         <div class="section-sub" style="margin-bottom:2px;">Sprint finish</div>
         <div style="font-family:var(--font-pixel); font-size:34px; color:${sprintPos && sprintPos<=3?'var(--candy-yellow)':'var(--ink)'};">${sprintPos?'P'+sprintPos:'DNF'}</div>
@@ -6783,6 +7385,83 @@ Object.assign(App, {
       return `Good grid slot, P${gridPos}. Push hard and control this from the front.`;
     }
     return null; // no situational advice -- fall back to the normal radio-personality line
+  },
+
+  /* ---------------- TEAM OWNERSHIP MODE -- STRATEGY CALLS (Pass 25, full closure) ----------------
+     Lets the owner make a REAL approach+compound strategy call for each of
+     their two AI drivers before race day, instead of both always silently
+     defaulting to 'saveTires'/'medium' (autoResolveOwnerRaceWeekend()'s old
+     hardcoded executeRace('saveTires','medium',0,'none') call). Stored as
+     p._ownerAiStrategy = {[driverId]: {approach, compound}}, read by
+     executeRace()/resolveSprintRace() as simulateRace()'s new OPTIONAL
+     aiStrategyOverrides parameter (engine.js) -- see that function's own
+     comment for exactly how it's applied without touching any other
+     driver's math. Cleared after the main race resolves each weekend
+     (executeRace()), so it's a genuine weekly decision, not a
+     set-once-forget-it toggle. The player's own driver (which still
+     technically races every Owner Mode weekend, auto-resolved -- see
+     renderOwnerHQScreen()'s Race Seats panel) is NOT included here: this
+     screen is specifically about calling strategy for the team's AI
+     seats, matching a real team principal's actual job. */
+  renderOwnerStrategyModal(){
+    const s = this.state; const p = s.player;
+    const teamDrivers = s.grid.filter(d=>d.teamId===p.teamId);
+    if(!p._ownerAiStrategy) p._ownerAiStrategy = {};
+    const approachOptions = [
+      {id:'push', icon:'🔥', label:'Push'},
+      {id:'attack', icon:'⚡', label:'Attack'},
+      {id:'defend', icon:'🛡️', label:'Defend'},
+      {id:'saveTires', icon:'🛞', label:'Save Tires'},
+    ];
+    const compoundOptions = [
+      {id:'soft', icon:'🔴', label:'Soft'},
+      {id:'medium', icon:'🟡', label:'Medium'},
+      {id:'hard', icon:'⚪', label:'Hard'},
+    ];
+    this.openModal(`
+      ${this.modalHeader('Set Race Strategy')}
+      <div class="section-sub" style="margin-bottom:10px;">Call a real strategy for each of your AI drivers this weekend — it's applied exactly like a player's own choice would be.</div>
+      ${teamDrivers.map(d=>{
+        const current = p._ownerAiStrategy[d.id] || {approach:'saveTires', compound:'medium'};
+        return `
+        <div class="pixel-panel" style="margin-bottom:10px;">
+          <div style="font-weight:800; margin-bottom:6px;">${d.flag} ${d.name}</div>
+          <div class="section-sub" style="margin-bottom:4px;">Approach</div>
+          <div class="pbtn-row" style="margin-bottom:8px; flex-wrap:wrap;">
+            ${approachOptions.map(a=>`<button class="pbtn small ${current.approach===a.id?'gold':''}" data-owner-approach="${d.id}:${a.id}" style="flex:1 1 45%;">${a.icon} ${a.label}</button>`).join('')}
+          </div>
+          <div class="section-sub" style="margin-bottom:4px;">Tire Compound</div>
+          <div class="pbtn-row">
+            ${compoundOptions.map(c=>`<button class="pbtn small ${current.compound===c.id?'gold':''}" data-owner-compound="${d.id}:${c.id}" style="flex:1;">${c.icon} ${c.label}</button>`).join('')}
+          </div>
+        </div>`;
+      }).join('')}
+      ${!teamDrivers.length ? `<div class="empty-state"><div class="ic">🏎️</div>No AI drivers to call strategy for yet.</div>` : ''}
+      <button class="pbtn full gold" id="btn-owner-strategy-done" style="margin-top:4px;">Confirm Strategy</button>
+    `);
+    this.wireModalClose();
+    document.querySelectorAll('[data-owner-approach]').forEach(btn=>{
+      btn.onclick = ()=>{
+        const [driverId, approach] = btn.dataset.ownerApproach.split(':');
+        if(!p._ownerAiStrategy[driverId]) p._ownerAiStrategy[driverId] = {approach:'saveTires', compound:'medium'};
+        p._ownerAiStrategy[driverId].approach = approach;
+        this.renderOwnerStrategyModal();
+      };
+    });
+    document.querySelectorAll('[data-owner-compound]').forEach(btn=>{
+      btn.onclick = ()=>{
+        const [driverId, compound] = btn.dataset.ownerCompound.split(':');
+        if(!p._ownerAiStrategy[driverId]) p._ownerAiStrategy[driverId] = {approach:'saveTires', compound:'medium'};
+        p._ownerAiStrategy[driverId].compound = compound;
+        this.renderOwnerStrategyModal();
+      };
+    });
+    document.getElementById('btn-owner-strategy-done').onclick = ()=>{
+      this.toast('📋 Strategy locked in for this weekend.');
+      this.closeModal();
+      this.saveState();
+      this.renderHub();
+    };
   },
 
   renderRaceStrategyPrompt(){
@@ -7121,11 +7800,26 @@ Object.assign(App, {
     if(!teammateEntry) return null;
     const tmResult = results.find(r=>r.driverId===teammateEntry.id);
     if(!tmResult || tmResult.dnf) return null;
-    // Teammate must be immediately ahead of the player (1 position) for a
-    // "hold position, let them through" order to make sense at all.
-    if(tmResult.position !== playerResult.position - 1) return null;
-    if(playerResult.position < 2) return null; // nothing to swap into if the player is already leading
-    return { teammateId: teammateEntry.id, teammateName: teammateEntry.name, playerPos: playerResult.position, teammatePos: tmResult.position };
+    // Original case: teammate immediately ahead of the player -- the team
+    // asks the PLAYER (trailing) to hold position so the teammate keeps
+    // their spot.
+    if(tmResult.position === playerResult.position - 1 && playerResult.position >= 2){
+      return { mode:'holdForTeammate', teammateId: teammateEntry.id, teammateName: teammateEntry.name, playerPos: playerResult.position, teammatePos: tmResult.position };
+    }
+    // Feature idea #8 -- the mirror case: the PLAYER is immediately ahead of
+    // the teammate (the player is the "struggling leader" here -- ahead on
+    // track but on older tires/a tougher strategy) and the team asks the
+    // TRAILING driver (the teammate, who has the pace to pass) to instead
+    // hold station behind the player for a joint strategy reason. Same
+    // adjacency gate and rarity as the original case, roles reversed:
+    // complying means the position stays exactly as it is (no swap at all
+    // -- the ask IS "don't take the position you could take"), refusing
+    // means the teammate takes the position anyway (an insertion-move swap,
+    // same applyTeamOrdersSwap() call the original case uses).
+    if(tmResult.position === playerResult.position + 1 && playerResult.position >= 1){
+      return { mode:'letLeaderThrough', teammateId: teammateEntry.id, teammateName: teammateEntry.name, playerPos: playerResult.position, teammatePos: tmResult.position };
+    }
+    return null;
   },
   applyTeamOrdersSwap(results, teammateId){
     const playerResult = results.find(r=>r.driverId==='player');
@@ -7190,9 +7884,38 @@ Object.assign(App, {
     const track = TRACKS.find(t=>t.id===round.trackId);
     const weather = round.weather;
     const trackTemp = round.trackTemp;
+    // Feature idea #14 -- Home Track race-day bonus, made explicit here
+    // instead of relying on it merely surviving as a leftover from
+    // resolveQualifying()/resolveSprintQualifying() setting p.isHomeTrackBonus
+    // earlier the same weekend (driverStrength(), engine.js, reads
+    // driver.isHomeTrackBonus directly off whatever's passed in -- it was
+    // already being applied at race time as an accidental side effect of
+    // object identity, just never set HERE explicitly and never disclosed
+    // to the player as a race-day effect). Setting it explicitly on this
+    // exact line makes the race day bonus correct and self-contained
+    // regardless of what happened earlier in the weekend, and this._homeTrackBonusThisRace
+    // is used below to show a disclosed fan-favorite flavor line when it applies.
+    p.isHomeTrackBonus = isHomeTrack(s, track.id) ? HOME_TRACK_PACE_BONUS : 0;
+    const homeTrackBonusAppliedThisRace = p.isHomeTrackBonus > 0;
+    // Constructor rivalry post-race follow-up (Pass 23 REMAINING BACKLOG
+    // item, closed this pass): snapshot the gap BEFORE this race's points
+    // are scored, so finishExecuteRace() can show how the race actually
+    // swung it -- reuses the SAME getConstructorRival() function the
+    // pre-race flavor chip already calls, just captured at two different
+    // points in time rather than any new comparison logic.
+    const constructorGapBeforeRace = this.getConstructorRival();
     const ideal = trueIdealSetup(track, p);
     const setupBonus = setupMatchBonus(s.currentSetup, ideal, getDifficultySettings(s).setupWindow);
-    const paceBonus = setupBonus + cosmeticPaceBonus(this.getCosmeticBonuses()) + (formationPaceBonus||0);
+    // Feature idea #7 -- "Wet Setup" prep choice trade-off. Set by
+    // renderWetSetupPromptModal() on the Thursday eve of a forecasted-wet
+    // race weekend (app_hub.js renderTodayActions()). Reuses the EXACT same
+    // setupMatchBonus() pace-unit scale everything else on this line uses --
+    // not a second setup system, just one more signed term added into the
+    // same paceBonus total. A small dry-conditions penalty trades for a
+    // slightly larger wet-conditions bonus if it actually rains, and clears
+    // itself the moment this race resolves either way.
+    const wetSetupTerm = p._wetSetupChosen ? (weather==='rain' ? 2.4 : -1.4) : 0;
+    const paceBonus = setupBonus + cosmeticPaceBonus(this.getCosmeticBonuses()) + (formationPaceBonus||0) + wetSetupTerm;
     const qualy = s.lastQualyResults || simulateQualifying(s.grid, p, track, weather, paceBonus, trackTemp);
     // Multi-weekend mechanical-failure consequence chain (engine.js): fade
     // last weekend's elevated risk a little before THIS weekend's roll,
@@ -7201,7 +7924,17 @@ Object.assign(App, {
     // renderTeamScreen()). Reading p.mechanicalRiskMult happens inside
     // simulateRace() itself; this only decays the carried-over value.
     decayMechanicalRisk(p);
-    const results = simulateRace(s.grid, p, qualy, track, weather, {approach, compound: compound||'medium'}, getDifficultySettings(s), this.getTeamMorale(p.teamId), paceBonus, trackTemp);
+    // Team Ownership Mode full closure (Pass 25): if the owner set a
+    // strategy call for either of their two AI drivers this weekend
+    // (renderOwnerStrategyModal(), below), pass it through as
+    // simulateRace()'s new OPTIONAL 11th argument -- every other call
+    // site in the codebase omits this argument entirely and is completely
+    // unaffected (see simulateRace()'s own comment, engine.js). Cleared
+    // the moment this race resolves, same one-race-weekend lifecycle as
+    // p._wetSetupChosen above.
+    const aiStrategyOverrides = p._ownerAiStrategy || undefined;
+    const results = simulateRace(s.grid, p, qualy, track, weather, {approach, compound: compound||'medium'}, getDifficultySettings(s), this.getTeamMorale(p.teamId), paceBonus, trackTemp, aiStrategyOverrides);
+    if(p._ownerAiStrategy) p._ownerAiStrategy = null;
     // Captured BEFORE maybeApplySafetyCar can mutate a finisher into a DNF --
     // the mechanical-risk consequence chain should only respond to a real
     // reliability-driven failure from simulateRace's own failChance roll,
@@ -7211,7 +7944,7 @@ Object.assign(App, {
     const safetyCarEvent = this.maybeApplySafetyCar(results, qualy);
     const weatherShiftEvent = this.maybeApplyWeatherShift(results, weather, track);
     const pitStopEvent = this.maybeApplyPitStopStrategy(results, pitCall);
-    const ctx = { track, weather, trackTemp, qualy, results, playerHadMechanicalDNF, safetyCarEvent, weatherShiftEvent, pitStopEvent, approach };
+    const ctx = { track, weather, trackTemp, qualy, results, playerHadMechanicalDNF, safetyCarEvent, weatherShiftEvent, pitStopEvent, approach, homeTrackBonusAppliedThisRace, constructorGapBeforeRace };
     // Team orders (feature idea #7): checked here, AFTER every other
     // post-scoring position event has already settled the results array but
     // BEFORE fastest-lap/points/career-stats are attributed to it -- a swap
@@ -7228,7 +7961,10 @@ Object.assign(App, {
       // sensible team principal would make most of the time, and the one
       // with a purely positive/neutral effect (morale up, no downside)
       // rather than picking the confrontational refuse branch by default.
-      this.applyTeamOrdersSwap(ctx.results, teamOrdersMoment.teammateId);
+      // Feature idea #8's mirror case (mode:'letLeaderThrough') has NO
+      // swap on comply (see renderTeamOrdersModal below) -- only the
+      // original case (mode:'holdForTeammate') swaps here.
+      if(teamOrdersMoment.mode==='holdForTeammate') this.applyTeamOrdersSwap(ctx.results, teamOrdersMoment.teammateId);
       this.adjustTeamMorale(p.teamId, 6);
       const teammate = s.grid.find(d=>d.id===teamOrdersMoment.teammateId);
       if(teammate) teammate.respect = clamp((teammate.respect||50) + 8, 0, 100);
@@ -7240,26 +7976,38 @@ Object.assign(App, {
     }
   },
 
-  /* ---------------- TEAM ORDERS MODAL (feature idea #7) ----------------
-     Complying: the player yields the position back to the teammate (a
-     small, bounded team-orders swap via applyTeamOrdersSwap -- reuses the
-     exact insertion-move pattern every other post-scoring event here
-     already uses) -- costs the position itself but GAINS team trust
-     (a morale bump via adjustTeamMorale, plus a positive nudge to the
-     teammate's own respect, mirroring how rival respect already works in
-     updateRivalry()). Refusing keeps the position but costs team morale
-     -- a real trade-off, not a free choice either way. */
+  /* ---------------- TEAM ORDERS MODAL (feature idea #7, extended by #8) ----------------
+     mode:'holdForTeammate' (original): Complying yields the position back
+     to the teammate via applyTeamOrdersSwap -- costs the position, gains
+     team trust. Refusing keeps the position but costs morale.
+     mode:'letLeaderThrough' (feature idea #8's mirror case): the teammate
+     is trailing but faster; the team asks them to hold station rather than
+     pass the struggling player ahead. Complying means NO swap happens at
+     all (the position simply stays as-is -- the ask IS "don't take it"),
+     and gains team trust exactly like the original case. Refusing means
+     the teammate takes the position anyway (the SAME applyTeamOrdersSwap()
+     call the original case's comply branch uses), costing morale the same
+     way the original case's refuse branch does -- so either mode ends up
+     calling applyTeamOrdersSwap() on exactly one of its two branches,
+     never both, and never on the same branch twice. */
   renderTeamOrdersModal(moment, ctx){
     const s = this.state; const p = s.player;
+    const isMirror = moment.mode==='letLeaderThrough';
+    const radioLine = isMirror
+      ? `"${p.name}, ${moment.teammateName} has the pace to pass right now, but we'd like them to hold station behind you. Are you good with us asking that?"`
+      : `"${p.name}, we need you to hold position and let ${moment.teammateName} through. Can you do that for us?"`;
+    const contextLine = isMirror
+      ? `${moment.teammateName} is running P${moment.teammatePos}, right behind you in P${moment.playerPos}. The team wants to protect YOUR result this time.`
+      : `You're currently running P${moment.playerPos}, right behind ${moment.teammateName} in P${moment.teammatePos}. The team wants to protect that result.`;
     this.openModal(`
       ${this.modalHeader('Team Radio')}
       <div class="pixel-panel">
-        <div style="font-weight:800;">"${p.name}, we need you to hold position and let ${moment.teammateName} through. Can you do that for us?"</div>
+        <div style="font-weight:800;">${radioLine}</div>
       </div>
-      <div class="section-sub" style="margin:8px 0;">You're currently running P${moment.playerPos}, right behind ${moment.teammateName} in P${moment.teammatePos}. The team wants to protect that result.</div>
+      <div class="section-sub" style="margin:8px 0;">${contextLine}</div>
       <div class="stack-8">
-        <button class="pbtn full gold" id="btn-orders-comply">🤝 Comply — let them through</button>
-        <button class="pbtn full" id="btn-orders-refuse">🚫 Refuse — hold your position</button>
+        <button class="pbtn full gold" id="btn-orders-comply">${isMirror ? '🤝 Agree — ask them to hold station' : '🤝 Comply — let them through'}</button>
+        <button class="pbtn full" id="btn-orders-refuse">${isMirror ? '🚫 Decline — let them race for it' : '🚫 Refuse — hold your position'}</button>
       </div>
     `);
     // Must-resolve: the race has already been fully simulated by this point
@@ -7269,19 +8017,27 @@ Object.assign(App, {
     if(closeBtn) closeBtn.style.display = 'none';
     if(this.activeModal) this.activeModal.onclick = null;
     document.getElementById('btn-orders-comply').onclick = ()=>{
-      this.applyTeamOrdersSwap(ctx.results, moment.teammateId);
+      // holdForTeammate: comply swaps (player yields to teammate).
+      // letLeaderThrough: comply does NOT swap (teammate holds station,
+      // position stays exactly as-is) -- see comment block above.
+      if(!isMirror) this.applyTeamOrdersSwap(ctx.results, moment.teammateId);
       this.adjustTeamMorale(p.teamId, 6);
       const teammate = s.grid.find(d=>d.id===moment.teammateId);
       if(teammate) teammate.respect = clamp((teammate.respect||50) + 8, 0, 100);
-      this.toast(`🤝 You let ${moment.teammateName} through. The team appreciates it.`);
-      p.journal.unshift({season:s.season, week:s.week, title:'Team Orders', text:`Complied with team orders at ${ctx.track.name}, yielding position to ${moment.teammateName}.`, icon:'🤝'});
+      this.toast(isMirror ? `🤝 ${moment.teammateName} holds station behind you. The team appreciates it.` : `🤝 You let ${moment.teammateName} through. The team appreciates it.`);
+      p.journal.unshift({season:s.season, week:s.week, title:'Team Orders', text: isMirror ? `Asked ${moment.teammateName} to hold station behind you at ${ctx.track.name}, and they agreed.` : `Complied with team orders at ${ctx.track.name}, yielding position to ${moment.teammateName}.`, icon:'🤝'});
       this.closeModal();
       this.finishExecuteRace(ctx, { complied:true, teammateName: moment.teammateName });
     };
     document.getElementById('btn-orders-refuse').onclick = ()=>{
+      // holdForTeammate: refuse does NOT swap (player keeps their spot).
+      // letLeaderThrough: refuse DOES swap (teammate takes the position
+      // they had the pace for anyway) -- the inverse of the comply branch
+      // above, so exactly one branch per mode ever calls the swap.
+      if(isMirror) this.applyTeamOrdersSwap(ctx.results, moment.teammateId);
       this.adjustTeamMorale(p.teamId, -8);
-      this.toast(`🚫 You held your position. The team isn't thrilled, but it's your result.`);
-      p.journal.unshift({season:s.season, week:s.week, title:'Team Orders Defied', text:`Refused a team order to yield position to ${moment.teammateName} at ${ctx.track.name}.`, icon:'🚫'});
+      this.toast(isMirror ? `🚫 ${moment.teammateName} races past you. The team isn't thrilled, but that's racing.` : `🚫 You held your position. The team isn't thrilled, but it's your result.`);
+      p.journal.unshift({season:s.season, week:s.week, title:'Team Orders Defied', text: isMirror ? `Declined to have ${moment.teammateName} hold station at ${ctx.track.name} -- they raced past instead.` : `Refused a team order to yield position to ${moment.teammateName} at ${ctx.track.name}.`, icon:'🚫'});
       this.closeModal();
       this.finishExecuteRace(ctx, { complied:false, teammateName: moment.teammateName });
     };
@@ -7289,8 +8045,12 @@ Object.assign(App, {
 
   finishExecuteRace(ctx, teamOrdersOutcome){
     const s = this.state; const p = s.player;
-    const { track, weather, trackTemp, qualy, results, playerHadMechanicalDNF, safetyCarEvent, weatherShiftEvent, pitStopEvent, approach } = ctx;
+    const { track, weather, trackTemp, qualy, results, playerHadMechanicalDNF, safetyCarEvent, weatherShiftEvent, pitStopEvent, approach, homeTrackBonusAppliedThisRace, constructorGapBeforeRace } = ctx;
     const round = this.getCurrentRound();
+    // Feature idea #7 -- Wet Setup is a one-race trade-off; clear it now
+    // that this race has resolved so it doesn't silently carry into next
+    // weekend's paceBonus calculation.
+    if(p._wetSetupChosen) p._wetSetupChosen = false;
     const fastestLapDriverId = rollFastestLap(results, [...s.grid, p]);
     if(fastestLapDriverId){
       const flDrv = fastestLapDriverId==='player' ? p : s.grid.find(d=>d.id===fastestLapDriverId);
@@ -7324,6 +8084,31 @@ Object.assign(App, {
         const newSecs = parseSecs(lapTimeText);
         if(!existing || newSecs < parseSecs(existing.lapTimeText)){
           s.trackRecords[track.id] = { driverName: flDrv.name, lapTimeText, season: s.season, isPlayer: fastestLapDriverId==='player' };
+        }
+      }
+    }
+
+    /* Feature idea #2 -- personal best alongside the all-time record. Shown
+       underneath the existing per-track record entry in the Museum (see
+       renderMuseumModal(), app_screens.js). Reuses plausibleLapTime() with
+       the player's OWN finishing position this race (not tied to whether
+       they set the fastest lap -- every finish produces a plausible time),
+       tracked in p.playerTrackBests, same parse-back-to-seconds-for-
+       comparison approach as s.trackRecords above. Purely a Museum display
+       value, never read by any mechanical system. */
+    {
+      const ownResult = results.find(r=>r.driverId==='player');
+      if(ownResult && !ownResult.dnf && ownResult.position){
+        const ownLapTimeText = plausibleLapTime(track, ownResult.position, results.length);
+        const parseSecs = (txt)=>{
+          const m = txt.match(/^(?:(\d+):)?(\d+\.\d+)s?$/);
+          if(!m) return Infinity;
+          return (m[1]?parseInt(m[1],10)*60:0) + parseFloat(m[2]);
+        };
+        if(!p.playerTrackBests) p.playerTrackBests = {};
+        const existingBest = p.playerTrackBests[track.id];
+        if(!existingBest || parseSecs(ownLapTimeText) < parseSecs(existingBest.lapTimeText)){
+          p.playerTrackBests[track.id] = { lapTimeText: ownLapTimeText, season: s.season };
         }
       }
     }
@@ -7362,6 +8147,52 @@ Object.assign(App, {
       if(r.position<=3){ drv.careerStats.podiums++; if(isPlayer) s.seasonStats.podiums++; }
       if(isPlayer) s.seasonStats.points += pts;
     });
+
+    // Constructor rivalry post-race follow-up (Pass 23 REMAINING BACKLOG
+    // item, closed Pass 24; edge case closed Pass 25) -- read the SAME
+    // getConstructorRival() gap again now that this race's points are
+    // actually scored, and compare against the pre-race snapshot captured
+    // in executeRace() to describe how the race actually swung the fight.
+    // Two branches:
+    //   1. Same closest rival before and after -- describe the swing
+    //      directly (the original Pass 24 behavior, unchanged).
+    //   2. The closest rival CHANGED (a real possibility in a tight
+    //      midfield, previously left silently blank) -- that change is
+    //      itself the headline. getConstructorRival() always returns
+    //      whichever team is closest at the moment it's called, so simply
+    //      calling it again after scoring and comparing team identity
+    //      (not just the gap number) tells us definitively whether a
+    //      changeover happened, and to/from which teams -- no new
+    //      tracking, just reading the same function's output twice more
+    //      carefully than before.
+    let constructorSwingLine = '';
+    if(constructorGapBeforeRace && Math.abs(constructorGapBeforeRace.gap) <= 15){
+      const afterGap = this.getConstructorRival();
+      if(afterGap && afterGap.team.id === constructorGapBeforeRace.team.id){
+        const swing = constructorGapBeforeRace.gap - afterGap.gap; // positive = gap closed/reversed in the player's favor
+        if(swing !== 0){
+          const verb = swing > 0 ? 'closed the gap to' : 'lost ground to';
+          const swingAbs = Math.abs(swing);
+          const newStanding = afterGap.gap > 0 ? `now trail by ${afterGap.gap} point${afterGap.gap===1?'':'s'}` : afterGap.gap < 0 ? `now lead by ${-afterGap.gap} point${-afterGap.gap===1?'':'s'}` : 'are now dead level';
+          constructorSwingLine = `🏆 Constructors' battle: this race ${verb} ${afterGap.team.name} by ${swingAbs} point${swingAbs===1?'':'s'} — you ${newStanding}.`;
+        }
+      } else if(afterGap && afterGap.team.id !== constructorGapBeforeRace.team.id && Math.abs(afterGap.gap) <= 15){
+        // The closest rival changed AND the new one is still genuinely
+        // close (same <=15 threshold) -- a real, headline-worthy
+        // changeover, not just noise from a distant team's points
+        // shuffling around. Framed as "new closest rival" rather than a
+        // numeric swing, since a swing number across two different teams'
+        // gaps wouldn't mean anything (closing 3 points on Team X isn't
+        // comparable to opening 8 on Team Y -- they're different races).
+        const newStanding = afterGap.gap > 0 ? `trail by ${afterGap.gap} point${afterGap.gap===1?'':'s'}` : afterGap.gap < 0 ? `lead by ${-afterGap.gap} point${-afterGap.gap===1?'':'s'}` : 'are dead level';
+        constructorSwingLine = `🏆 Constructors' battle: the standings reshuffled — ${afterGap.team.name} is now your closest rival (was ${constructorGapBeforeRace.team.name}). You ${newStanding} with them.`;
+      }
+      // A third, deliberately silent case remains: the closest rival
+      // changed to a team that's now MORE than 15 points away. That's a
+      // genuine "no longer a real fight" outcome, not a headline -- correctly
+      // producing no chip, same as a race that simply didn't move the
+      // needle at all.
+    }
 
     if(playerResult && !playerResult.dnf && teammateEntry){
       const tmResult = results.find(r=>r.driverId===teammateEntry.id);
@@ -7448,7 +8279,21 @@ Object.assign(App, {
     if(leadershipBoost>0) this.adjustTeamMorale(p.teamId, leadershipBoost);
 
     const completedRoundIndex = s.calendar.currentRound; // capture BEFORE increment -- this is the round that just finished
+    // Feature idea #1 -- weather radar "track is rubbering in" flavor text.
+    // Tracks a small per-track consecutive-dry-weekend counter so the radar
+    // strip (app_hub.js renderRadarTrendStrip()) can layer on a flavor line
+    // the next time this track comes back around dry. Minimal, single-field
+    // state (not derivable from anything already persisted, since a given
+    // track only appears once per season and there's no other per-track
+    // weather history recorded anywhere) -- reset to 0 the moment a wet
+    // weekend breaks the streak, incremented on every dry one.
+    if(!s.trackDryStreak) s.trackDryStreak = {};
+    s.trackDryStreak[track.id] = weather==='rain' ? 0 : (s.trackDryStreak[track.id]||0) + 1;
     round.completed = true;
+    // Feature idea #19 -- Weekend Media Day is once-per-race-weekend; clear
+    // the flag now that this weekend's race has concluded so the chip can
+    // appear again on next race week's Thursday.
+    if(p._weekendMediaDayDoneThisWeekend) p._weekendMediaDayDoneThisWeekend = false;
     s.calendar.currentRound++;
     s.lastQualyResults = null;
     if(!s.cosmetics) s.cosmetics = this.initialCosmeticsState();
@@ -7472,7 +8317,7 @@ Object.assign(App, {
     s.lastRaceHeadline = { track: track.name, position: pos, dnf: playerResult.dnf };
 
     const playerQualy = qualy.find(q=>q.driverId==='player');
-    this.openModal(this.renderRaceResultHtml(results, pos, playerResult.dnf, headline, moneyGain, fanGain, sponsorIncome, playerQualy, track, safetyCarEvent, weatherShiftEvent, playerHasFastestLap, playerHadMechanicalDNF, pitStopEvent, teamOrdersOutcome));
+    this.openModal(this.renderRaceResultHtml(results, pos, playerResult.dnf, headline, moneyGain, fanGain, sponsorIncome, playerQualy, track, safetyCarEvent, weatherShiftEvent, playerHasFastestLap, playerHadMechanicalDNF, pitStopEvent, teamOrdersOutcome, homeTrackBonusAppliedThisRace, constructorSwingLine));
     // No X close button here -- this MUST resolve via Continue. The X button
     // previously just removed the modal from the DOM (closeModal(), no
     // re-render) while round.completed/s.calendar.currentRound had ALREADY
@@ -7600,7 +8445,7 @@ Object.assign(App, {
     return {title:`QUIET WEEKEND FOR ${p.name.toUpperCase()}`, body:`A tough race leaves ${p.name} outside the points at ${track.name}.`};
   },
 
-  renderRaceResultHtml(results, pos, dnf, headline, moneyGain, fanGain, sponsorIncome, playerQualy, track, safetyCarEvent, weatherShiftEvent, playerHasFastestLap, mechanicalDNF, pitStopEvent, teamOrdersOutcome){
+  renderRaceResultHtml(results, pos, dnf, headline, moneyGain, fanGain, sponsorIncome, playerQualy, track, safetyCarEvent, weatherShiftEvent, playerHasFastestLap, mechanicalDNF, pitStopEvent, teamOrdersOutcome, homeTrackBonusAppliedThisRace, constructorSwingLine){
     const top10 = results.slice(0,10).map(r=>{
       const isPlayer = r.driverId==='player';
       const drv = isPlayer ? this.state.player : this.state.grid.find(d=>d.id===r.driverId);
@@ -7660,6 +8505,20 @@ Object.assign(App, {
       else if(delta<0) gridNote = `<div class="section-sub" style="margin:6px 0 0;">Started P${startPos}, lost ${Math.abs(delta)} place${Math.abs(delta)===1?'':'s'} on race day.</div>`;
       else if(startPos>3) gridNote = `<div class="section-sub" style="margin:6px 0 0;">Started P${startPos} and held station — the grid penalty here cost roughly ${estCost} tenths of pace off the line.</div>`;
     }
+    // Feature idea #22 -- full race radio/commentary log. The radio line
+    // settled above (rival-specific, generic personality-bank, or
+    // stat-attributed) was previously shown once in this result modal and
+    // then lost forever the moment the modal closed. Persisting it turns
+    // that ephemeral flavor line into a permanent, reviewable history --
+    // reusing the exact SAME radio value already computed above, no
+    // second radio-line system. Capped at a reasonable length so a long
+    // career's save file doesn't grow unbounded.
+    if(!this.state.player.radioLog) this.state.player.radioLog = [];
+    this.state.player.radioLog.unshift({
+      season: this.state.season, week: this.state.week, track: track ? track.name : null,
+      text: radio, category, position: pos, dnf,
+    });
+    if(this.state.player.radioLog.length>200) this.state.player.radioLog.pop();
     return `
       ${this.modalHeader('Race Result')}
       ${safetyCarEvent ? `<div class="chip red" style="margin-bottom:8px; display:block;">🚨 Safety Car — the field bunched up${safetyCarEvent.caughtOutDriverId==='player' ? ', and you were caught out by the chaos' : ''}.</div>` : ''}
@@ -7667,6 +8526,8 @@ Object.assign(App, {
       ${pitStopEvent ? `<div class="chip ${pitStopEvent.worked?'mint':'red'}" style="margin-bottom:8px; display:block;">${pitStopEvent.call==='undercut'?'⏪':'⏩'} ${pitStopEvent.call==='undercut'?'Undercut':'Overcut'} call ${pitStopEvent.worked?'paid off':'didn\'t pay off'} — ${pitStopEvent.worked?`gained ${pitStopEvent.delta} place${Math.abs(pitStopEvent.delta)===1?'':'s'}`:`lost ${Math.abs(pitStopEvent.delta)} place${Math.abs(pitStopEvent.delta)===1?'':'s'}`} on the timing.</div>` : ''}
       ${teamOrdersOutcome ? `<div class="chip ${teamOrdersOutcome.complied?'mint':'gold'}" style="margin-bottom:8px; display:block;">📻 Team Orders — ${teamOrdersOutcome.complied ? `you let ${teamOrdersOutcome.teammateName} through.` : `you held position over ${teamOrdersOutcome.teammateName}.`}</div>` : ''}
       ${playerHasFastestLap ? `<div class="chip gold" style="margin-bottom:8px; display:block;">⏱️ Fastest Lap! +$1M, +20 fans.</div>` : ''}
+      ${homeTrackBonusAppliedThisRace ? `<div class="chip mint" style="margin-bottom:8px; display:block;">🏠 Home Track boost — the crowd's energy gave you a small race-day pace bonus. A fan-favorite drive.</div>` : ''}
+      ${constructorSwingLine ? `<div class="chip gold" style="margin-bottom:8px; display:block;">${constructorSwingLine}</div>` : ''}
       ${mechanicalDNF ? `<div class="chip red" style="margin-bottom:8px; display:block;">🔧 That failure leaves the car a little fragile — reliability risk is elevated next weekend unless it's addressed at Team &amp; Car.</div>` : ''}
       <div class="headline-card">
         <div class="kicker">RACE REPORT</div>
@@ -7896,11 +8757,19 @@ Object.assign(App, {
     // fire-once shape the "old team resents you" callback below already
     // uses -- a fixed global key would have silently gone dead after the
     // first protégé-turned-rival, ignoring any later ones.
-    const protegeRival = s.grid.find(d=>d.isProtegeGraduate && (d.rivalryLevel||0)>=45);
-    if(protegeRival){
+    // Bug fix (Pass 23, found via a dedicated regression check): this
+    // previously used s.grid.find(...), which only ever returns the FIRST
+    // matching driver -- once one protégé-turned-rival qualified, find()
+    // kept returning that SAME driver forever, and a second, independently
+    // qualifying protégé could never fire its own callback at all, directly
+    // contradicting this comment block's own stated intent. filter()+
+    // forEach() actually delivers "fires again for each one that
+    // separately earns it."
+    const protegeRivals = s.grid.filter(d=>d.isProtegeGraduate && (d.rivalryLevel||0)>=45);
+    protegeRivals.forEach(protegeRival=>{
       fire(`protege_became_rival_${protegeRival.id}`, 'Full Circle',
         `${protegeRival.name} — the driver you once mentored — is now a genuine rival on track. The student has become the competition.`);
-    }
+    });
 
     // Old team resents you: a team the player left (present in history[]
     // with a DIFFERENT teamId than their current one) that's since fallen
@@ -7948,6 +8817,25 @@ function generateSeasonObjectives(state){
   else objectives.push({type:'points', text:'Score 20 championship points', target:20, reward:{money:4, rep:4}});
   objectives.push({type:'beatTeammate', text:'Out-score your teammate', target:1, reward:{money:2, rep:3}});
   objectives.push({type:'q3count', text:'Reach the Top 3 in qualifying 3 times', target:3, reward:{money:3, rep:3}});
+  // Feature idea #11 -- "chase the record" seasonal objective type: targets
+  // beating the current lap record (s.trackRecords, set in
+  // finishExecuteRace(), app_race.js) at an upcoming track this season.
+  // Reuses generateSeasonObjectives()'s existing {type,text,target,reward}
+  // shape exactly -- objectiveProgress()/processSeasonObjectiveRewards()
+  // below need only one new `if` branch each, no separate tracking system.
+  // Picked from calendar rounds not yet completed at objective-generation
+  // time (always true here -- objectives generate either at a fresh
+  // career or right at season start, before any round that season has
+  // run) so the target is always a genuinely upcoming race, not one
+  // already in the books.
+  if(state.calendar && state.calendar.rounds && state.calendar.rounds.length){
+    const upcoming = state.calendar.rounds.filter(r=>!r.completed);
+    if(upcoming.length){
+      const targetRound = pick(upcoming);
+      const track = TRACKS.find(t=>t.id===targetRound.trackId);
+      if(track) objectives.push({type:'chaseRecord', text:`Beat the lap record at ${track.name}`, target:1, reward:{money:5, rep:5}, trackId: track.id});
+    }
+  }
   return objectives;
 }
 
@@ -7983,6 +8871,15 @@ Object.assign(App, {
     }
     if(o.type==='beatTeammate') return s.seasonStats.beatTeammate ? 1 : 0;
     if(o.type==='q3count') return Math.min(o.target, s.seasonStats.q3count||0);
+    // Feature idea #11 -- "chase the record": met the moment s.trackRecords
+    // for the target track shows the player as the record holder (set the
+    // SAME finishExecuteRace() write every fastest-lap record already goes
+    // through -- no separate comparison logic here, just reading the
+    // result of that existing write).
+    if(o.type==='chaseRecord'){
+      const rec = (s.trackRecords||{})[o.trackId];
+      return (rec && rec.isPlayer) ? 1 : 0;
+    }
     return 0;
   },
 
@@ -8058,6 +8955,15 @@ Object.assign(App, {
         </div>
       </div>
       <div class="section-sub" style="text-align:center; margin-bottom:12px;">Active bonuses: ${bonusLine}</div>
+      <div class="section-title" style="margin-top:14px; font-size:10px; text-transform:capitalize;">Car Colorway <span style="font-weight:400; color:var(--ink-soft); text-transform:none;">(cosmetic only)</span></div>
+      <div class="stack-8">
+        ${CAR_COLORWAY_POOL.map(item=>{
+          const isEquipped = (p.carColorway||'colorway_default')===item.id;
+          return `<button class="pbtn full ${isEquipped?'gold':''}" style="justify-content:flex-start; text-align:left; height:auto; padding:10px;" data-colorway="${item.id}">
+            <span>${item.icon} <b>${item.name}</b>${isEquipped?' ✓':''}<br><span style="font-size:8.5px; color:var(--ink-soft);">${item.desc}</span></span>
+          </button>`;
+        }).join('')}
+      </div>
       ${COSMETIC_CATEGORIES.map(cat=>{
         const items = cosmeticsForCategory(cat);
         const equippedId = s.cosmetics.equipped[cat];
@@ -8075,6 +8981,14 @@ Object.assign(App, {
       }).join('')}
     `);
     this.wireModalClose();
+    document.querySelectorAll('[data-colorway]').forEach(btn=>{
+      btn.onclick = ()=>{
+        p.carColorway = btn.dataset.colorway;
+        this.saveState();
+        this.renderProfileModal();
+        this.toast('🎨 New colorway applied!');
+      };
+    });
     document.querySelectorAll('[data-cosmetic]:not(:disabled)').forEach(btn=>{
       btn.onclick = ()=>{
         s.cosmetics.equipped[btn.dataset.category] = btn.dataset.cosmetic;
@@ -8266,6 +9180,295 @@ Object.assign(App, {
   },
 
   /* ---------------- TEAM & CAR ---------------- */
+  /* ---------------- TEAM OWNERSHIP MODE -- OWNER HQ (Pass 23 REMAINING BACKLOG closure) ----------------
+     Pass 22 deliberately scoped Team Ownership Mode down to a flag on the
+     existing save shape (auto-resolved race weekends via _ownerSilent, the
+     player's own driver object still technically exists) rather than a
+     full "own UI screens and a redesigned driverStrength consumer for two
+     AI-controlled seats" -- that fuller rebuild would need
+     simulateRace()'s player-vs-grid distinction rebuilt, real surgery on
+     the core sim shared by every other system, and was explicitly flagged
+     as not attempted.
+
+     This closes the more tractable half of that gap: a genuine dedicated
+     screen for the owner's perspective, replacing the driver-flavored
+     renderTeamScreen() Owner Mode was previously just reusing wholesale
+     (own contract, own facilities, own release clause -- none of which
+     make sense from an owner's chair). Built ENTIRELY as a read/manage
+     layer over data that's already correct (team upgrades, facilities,
+     constructorsStandings(), s.grid's two AI drivers on p.teamId) --
+     zero changes to driverStrength()/simulateRace()/any scoring function.
+     The two AI drivers' race weekends still auto-resolve exactly as
+     before via autoResolveOwnerRaceWeekend()/_ownerSilent; this screen is
+     purely a better window onto that same underlying state. */
+  renderOwnerHQScreen(){
+    this.currentScreen = 'team';
+    const s = this.state; const p = s.player;
+    const team = this.getTeam(p.teamId);
+    document.querySelectorAll('.nav-item').forEach(b=>b.classList.toggle('active', b.dataset.nav==='team'));
+    this.updateStatusStrip();
+
+    const upgrades = [
+      {id:'aero', label:'Aero', icon:'🌬️', effect:'+2% corner speed / level'},
+      {id:'engine', label:'Engine', icon:'⚙️', effect:'+2% straight-line speed / level'},
+      {id:'chassis', label:'Chassis', icon:'🔩', effect:'+1.5% balance / level'},
+      {id:'suspension', label:'Suspension', icon:'🛠️', effect:'+1.5% kerb stability / level'},
+      {id:'reliability', label:'Reliability', icon:'🛡️', effect:'-3% failure chance / level'},
+    ];
+    const teamDrivers = s.grid.filter(d=>d.teamId===p.teamId);
+
+    this.root.innerHTML = `
+      <div class="pod-wrap" style="margin-bottom:6px;">
+        <div class="pod" style="width:96px; height:96px; border-color:${team.color};">
+          <span class="pod-sprite" style="font-size:40px;">🏗️</span>
+        </div>
+      </div>
+      <div class="pod-name-tag" style="margin-bottom:14px;">
+        <div class="nm" style="font-size:12px;">${team.flag} ${team.name}</div>
+        <div class="sub">${team.culture} · Team Principal ${p.name}</div>
+      </div>
+
+      <div class="pixel-panel">
+        <div class="panel-title">Race Seats</div>
+        <div class="section-sub" style="margin:0 0 8px;">Both seats are AI-driven under your ownership — race weekends auto-resolve using each driver's own real stats and the car you build below. Your career-mode driver still technically holds one seat, but strategy for it is auto-picked instead of chosen by you.</div>
+        <div class="stack-8">
+          ${(()=>{
+            // Feature idea #13 (Team Ownership Mode) fuller closure (Pass
+            // 23 REMAINING BACKLOG): the player's OWN driver object still
+            // races every weekend under Owner Mode -- autoResolveOwnerRaceWeekend()
+            // (app_race.js) drives it through the EXACT SAME executeRace()
+            // every normal career uses, just with strategy auto-picked
+            // ('saveTires'/'medium'/'none') instead of player-chosen. That
+            // means it's a genuine second scoring seat, not a placeholder --
+            // showing only the ONE other AI grid driver on this team
+            // undersold the "two-seat" framing by leaving out a seat that's
+            // actually racing and scoring points every week. Shown here
+            // with the SAME row shape as a real AI driver, distinctly
+            // labeled so it's clear this is the auto-resolved seat, not a
+            // third teammate.
+            const ownSeatPts = s.standings['player']||0;
+            const ownSeatPace = Math.round(p.attributes.driving.racePace);
+            const ownSeatRow = `<div class="row-item" style="align-items:flex-start; background:#fff8e6;">
+              <span style="font-size:18px;">${p.flag}</span>
+              <span style="flex:1;">
+                <div style="font-weight:800; font-size:12px;">${p.name} <span class="chip gold" style="font-size:8px;">Auto-resolved seat</span></div>
+                <div class="section-sub" style="margin:2px 0 0;">${ownSeatPts} pts this season · Race Pace ${ownSeatPace}/99 · ${p.careerStats.wins} career win${p.careerStats.wins===1?'':'s'}, ${p.careerStats.podiums} podium${p.careerStats.podiums===1?'':'s'}</div>
+              </span>
+            </div>`;
+            const aiRows = teamDrivers.map(d=>{
+              const pts = s.standings[d.id]||0;
+              const pace = Math.round(d.attributes.driving.racePace);
+              // Team Ownership Mode full closure (Pass 25) -- independent
+              // AI hiring/firing. A real owner action, not a cosmetic
+              // button: releases this specific AI driver and immediately
+              // signs a fresh rookie replacement in the same seat, reusing
+              // the EXACT same generateFreshDriverName()/makeRivalDriver()
+              // primitives every other roster-replacement path in this
+              // codebase already uses (retirement replacement, mid-season
+              // team-switch rebalancing) -- see fireAndHireDriver() below
+              // for the full cost/consequence shape.
+              return `<div class="row-item" style="align-items:flex-start;">
+                <span style="font-size:18px;">${d.flag}</span>
+                <span style="flex:1;">
+                  <div class="flex-between">
+                    <div style="font-weight:800; font-size:12px;">${d.name} <span style="font-weight:400; color:var(--ink-soft);">(age ${d.age})</span></div>
+                    <button class="pbtn small" data-release-ai-driver="${d.id}" style="color:#a33;">Release</button>
+                  </div>
+                  <div class="section-sub" style="margin:2px 0 0;">${pts} pts this season · Race Pace ${pace}/99 · ${d.careerStats.wins} career win${d.careerStats.wins===1?'':'s'}, ${d.careerStats.podiums} podium${d.careerStats.podiums===1?'':'s'}</div>
+                </span>
+              </div>`;
+            }).join('');
+            return ownSeatRow + aiRows;
+          })()}
+        </div>
+      </div>
+
+      <div class="pixel-panel">
+        <div class="panel-title">Team Chemistry</div>
+        ${this.renderPixelBar(this.getTeamMorale(team.id),'mood')}
+        <div class="section-sub" style="margin:6px 0 0;">${this.moraleDescription(this.getTeamMorale(team.id))} Good chemistry gives a small boost every race weekend, for BOTH seats.</div>
+      </div>
+
+      <div class="pixel-panel">
+        <div class="panel-title">Car Development <span class="tag">$${p.money}M</span></div>
+        <div class="section-sub" style="margin:0 0 4px;">Development slots this season: <b>${team.devSlotsUsed||0}/${this.devSlotsMax()}</b> <span style="color:var(--ink-soft);">(higher Engineering level = more slots)</span></div>
+        <div class="section-sub" style="margin:0 0 8px;">Cost rises with each level — a higher Factory level softens the climb. You inherited this team's existing development, so a bigger team starts further along.</div>
+        ${(()=>{
+          const slotsFullNow = (team.devSlotsUsed||0) >= this.devSlotsMax();
+          if(!slotsFullNow) return '';
+          const slotsWarnKey = `${s.season}`;
+          const isFirstAppearance = p.seenDevSlotsFullFor !== slotsWarnKey;
+          if(isFirstAppearance) p.seenDevSlotsFullFor = slotsWarnKey;
+          return `<div class="chip red ${isFirstAppearance?'warn-appear':''}" style="margin:0 0 8px; display:block;">⚠️ Development slots full for this season — more open up next season.</div>`;
+        })()}
+        <div class="chip blue" style="margin:0 0 8px; display:block;">🔧 ${this.suggestNextDevelopment()}</div>
+        <div class="stack-8">
+          ${upgrades.map(u=>{
+            const price = this.carUpgradeCost(u.id);
+            const level = (team.upgrades && team.upgrades[u.id]) || 0;
+            const slotsFull = (team.devSlotsUsed||0) >= this.devSlotsMax();
+            const disabled = level>=10 || p.money<price || slotsFull;
+            return `
+            <div>
+              <div class="flex-between" style="margin-bottom:5px;">
+                <span style="font-size:12px; font-weight:800;">${u.icon} ${u.label} <span style="color:var(--ink-soft); font-weight:600; font-size:10px;">Lv.${level}/10</span></span>
+                <button class="pbtn small gold" data-upgrade="${u.id}" ${disabled?'disabled':''}>+$${price.toFixed(1)}M</button>
+              </div>
+              ${this.renderPixelBar(level*10,'stat')}
+              <div class="section-sub" style="margin:4px 0 0;">${u.effect}${slotsFull && level<10 ? ' · <span style="color:var(--candy-red);">out of dev slots this season</span>' : ''}</div>
+            </div>
+          `;}).join('')}
+        </div>
+      </div>
+
+      <div class="pixel-panel">
+        <div class="panel-title">🏆 Constructors' Championship</div>
+        <div class="section-sub" style="margin:0 0 8px;">Real season points, both drivers combined per team — not a reflection of car strength alone.</div>
+        <div class="stack-8">
+          ${this.constructorsStandings().map((row,i)=>{
+            const isPlayerTeam = row.team.id===team.id;
+            return `<div class="row-item" style="${isPlayerTeam?'background:#fff8e6;':''}">
+              <span class="rname">${i+1}. ${row.team.flag} ${row.team.name}${isPlayerTeam?' (you)':''}</span>
+              <span class="rmeta">${row.points} pts</span>
+            </div>`;
+          }).join('')}
+        </div>
+      </div>
+
+      <div class="pixel-panel">
+        <div class="panel-title">Grid Pecking Order</div>
+        <div class="section-sub" style="margin:0 0 8px;">Every team develops their car over the off-season at their own pace — the field shifts every year.</div>
+        <div class="stack-8">
+          ${[...TEAMS].sort((a,b)=>b.carStrength-a.carStrength).map((t,i)=>{
+            const isPlayerTeam = t.id===team.id;
+            const prev = (s.prevTeamStrength||{})[t.id];
+            const trend = prev===undefined ? '' : t.carStrength>prev+0.4 ? '📈' : t.carStrength<prev-0.4 ? '📉' : '➖';
+            return `<div class="row-item" style="${isPlayerTeam?'background:#fff8e6;':''}">
+              <span class="rname">${i+1}. ${t.flag} ${t.name}${isPlayerTeam?' (you)':''}</span>
+              <span class="rmeta">${trend} Car ${Math.round(t.carStrength)}</span>
+            </div>`;
+          }).join('')}
+        </div>
+      </div>
+
+      <div class="pixel-panel">
+        <div class="panel-title">Facilities</div>
+        <div class="section-sub" style="margin:0 0 8px;">Later levels cost more to build out.</div>
+        <div class="stack-8">
+          ${Object.entries(s.facilities).map(([k,v])=>{
+            const price = this.facilityUpgradeCost(k);
+            return `
+            <div>
+              <div class="flex-between" style="margin-bottom:5px;">
+                <span style="font-size:12px; font-weight:800; text-transform:capitalize;">${k} <span style="color:var(--ink-soft); font-weight:600; font-size:10px;">Lv.${v}/5</span></span>
+                <button class="pbtn small mint" data-facility="${k}" ${v>=5 || p.money<price ? 'disabled':''}>+$${price.toFixed(1)}M</button>
+              </div>
+              ${this.renderPixelBar(v*20,'confidence',5)}
+              <div class="section-sub" style="margin:4px 0 0;">${this.facilityEffectText(k)}</div>
+            </div>
+          `;}).join('')}
+        </div>
+      </div>
+
+      <div class="pixel-panel">
+        <div class="panel-title">Season Objectives</div>
+        ${(s.seasonObjectives||[]).map(o=>{
+          const progress = this.objectiveProgress(o);
+          const pct = Math.min(100, Math.round((progress/o.target)*100));
+          return `<div style="margin-bottom:10px;">
+            <div class="flex-between" style="font-size:11.5px; margin-bottom:4px;"><span style="font-weight:700;">${o.text}</span><span style="color:var(--ink-soft);">${progress}/${o.target}</span></div>
+            ${this.renderPixelBar(pct,'stat')}
+          </div>`;
+        }).join('')}
+      </div>`;
+
+    document.querySelectorAll('[data-upgrade]').forEach(btn=>{
+      btn.onclick = ()=>{
+        const key = btn.dataset.upgrade;
+        const price = this.carUpgradeCost(key);
+        if(!team.upgrades) team.upgrades = buildInitialTeamUpgrades(team.tier);
+        if(team.devSlotsUsed===undefined) team.devSlotsUsed = 0;
+        if(p.money<price || team.upgrades[key]>=10 || team.devSlotsUsed>=this.devSlotsMax()) return;
+        p.money = Math.round((p.money-price)*10)/10;
+        team.upgrades[key]++;
+        team.devSlotsUsed++;
+        const gridAvg = TEAMS.reduce((sum,t)=>sum+t.carStrength,0) / TEAMS.length;
+        const aheadBy = Math.max(0, team.carStrength - gridAvg);
+        const gain = clamp(1 - aheadBy*0.03, 0.25, 1);
+        team.carStrength = clamp(Math.round((team.carStrength+gain)*10)/10, 0, 100);
+        this.toast(`${key} upgraded to Lv.${team.upgrades[key]}! (-$${price.toFixed(1)}M, dev slot ${team.devSlotsUsed}/${this.devSlotsMax()} used)`);
+        this.saveState();
+        this.renderOwnerHQScreen();
+      };
+    });
+    document.querySelectorAll('[data-facility]').forEach(btn=>{
+      btn.onclick = ()=>{
+        const key = btn.dataset.facility;
+        const price = this.facilityUpgradeCost(key);
+        if(p.money<price || s.facilities[key]>=5) return;
+        p.money = Math.round((p.money-price)*10)/10;
+        s.facilities[key]++;
+        this.toast(`${key[0].toUpperCase()+key.slice(1)} upgraded to Lv.${s.facilities[key]}! (-$${price.toFixed(1)}M)`);
+        this.saveState();
+        this.renderOwnerHQScreen();
+      };
+    });
+    document.querySelectorAll('[data-release-ai-driver]').forEach(btn=>{
+      btn.onclick = ()=> this.renderReleaseAiDriverConfirmModal(btn.dataset.releaseAiDriver);
+    });
+  },
+
+  /* Team Ownership Mode full closure (Pass 25) -- independent AI hiring/
+     firing. releaseAiDriverCost() gives this a real trade-off (money +
+     a genuine team-morale hit, same adjustTeamMorale() every other
+     chemistry-affecting decision in this codebase already goes through)
+     rather than being a free, consequence-free swap -- releasing a driver
+     mid-career should sting a little, the same way it would in real F1. */
+  releaseAiDriverCost(){
+    return { money: 4, moraleHit: 10 };
+  },
+  renderReleaseAiDriverConfirmModal(driverId){
+    const s = this.state; const p = s.player;
+    const driver = s.grid.find(d=>d.id===driverId);
+    if(!driver){ this.renderOwnerHQScreen(); return; }
+    const cost = this.releaseAiDriverCost();
+    this.openModal(`
+      ${this.modalHeader('Release Driver?')}
+      <div class="section-sub" style="margin-bottom:14px;">Release ${driver.name} and sign a fresh rookie in their place? This costs $${cost.money.toFixed(1)}M in contract buyout and a real hit to team chemistry (-${cost.moraleHit}) — the rest of the garage notices when a driver gets let go. This can't be undone.</div>
+      <div class="pbtn-row">
+        <button class="pbtn" id="btn-cancel-release-ai" style="flex:1;">Cancel</button>
+        <button class="pbtn" id="btn-confirm-release-ai" style="flex:1; background:var(--candy-red); color:#fff;" ${p.money<cost.money?'disabled':''}>Release ${driver.name}</button>
+      </div>
+    `);
+    this.wireModalClose();
+    document.getElementById('btn-cancel-release-ai').onclick = ()=> this.renderOwnerHQScreen();
+    document.getElementById('btn-confirm-release-ai').onclick = ()=>{
+      if(p.money<cost.money) return;
+      const oldName = driver.name;
+      p.money = Math.round((p.money-cost.money)*10)/10;
+      this.adjustTeamMorale(p.teamId, -cost.moraleHit);
+      // Same rivalry-cleanup + fresh-rookie-replacement shape
+      // processGridRetirements() (engine.js) already uses for a departing
+      // driver -- reused directly rather than duplicated.
+      if(s.rivalId === driver.id) s.rivalId = null;
+      // Clear this driver out of any owner strategy call queued for THIS
+      // weekend -- their replacement hasn't earned a strategy assignment
+      // yet, and the old id would otherwise silently point at nobody.
+      if(p._ownerAiStrategy && p._ownerAiStrategy[driver.id]) delete p._ownerAiStrategy[driver.id];
+      const freshName = generateFreshDriverName(s, driver.teamId);
+      const replacement = makeRivalDriver(freshName, driver.teamId);
+      replacement.age = randInt(19, 23); // same "replacements always enter as young rookies" convention as every other roster-replacement path
+      const idx = s.grid.findIndex(d=>d.id===driver.id);
+      if(idx>=0) s.grid[idx] = replacement;
+      this.toast(`📝 ${oldName} has been released. ${replacement.name} joins as their replacement.`);
+      this.pushNews(`📝 ${oldName} released by ${this.getTeam(p.teamId).name}. Rookie ${replacement.name} steps in.`);
+      p.journal.unshift({season:s.season, week:s.week, title:'Driver Released', text:`Released ${oldName} from the team and signed ${replacement.name} as a fresh rookie replacement.`, icon:'📝'});
+      this.closeModal();
+      this.saveState();
+      this.renderOwnerHQScreen();
+    };
+  },
+
   renderTeamScreen(){
     this.currentScreen = 'team';
     const s = this.state; const p = s.player;
@@ -8479,7 +9682,7 @@ Object.assign(App, {
       this.renderTeamScreen();
     };
     const releaseBtn = document.getElementById('btn-request-release');
-    if(releaseBtn) releaseBtn.onclick = ()=> this.renderReleaseClauseConfirmModal();
+    if(releaseBtn) releaseBtn.onclick = ()=> this.renderReleaseClauseReasonModal();
   },
 
   /* ---------------- CONTRACT RELEASE CLAUSE (feature idea #9) ----------------
@@ -8515,7 +9718,35 @@ Object.assign(App, {
     const rep = 8;
     return { money, rep };
   },
-  renderReleaseClauseConfirmModal(){
+  /* Feature idea #6 -- release clause "why" reason picker. Fires BEFORE the
+     existing confirm modal, purely to choose which flavor text lands in the
+     journal entry -- no mechanical effect of any kind, same cost/rep numbers
+     either way. reasonText is threaded through into
+     renderReleaseClauseConfirmModal() so the confirm screen and the journal
+     entry it eventually writes both reflect the chosen reason. */
+  RELEASE_CLAUSE_REASONS: [
+    { id:'creative', label:'Creative differences', journalText:'wanting creative differences with the team' },
+    { id:'title', label:'Chasing a title', journalText:'chasing a genuine title shot elsewhere' },
+    { id:'homesick', label:'Homesick', journalText:'wanting to be closer to home' },
+  ],
+  renderReleaseClauseReasonModal(){
+    this.openModal(`
+      ${this.modalHeader('Why leave?')}
+      <div class="section-sub" style="margin-bottom:10px;">Before you request a release, what's the reason you'll give the press?</div>
+      <div class="stack-8">
+        ${this.RELEASE_CLAUSE_REASONS.map(r=>`<button class="pbtn full" data-release-reason="${r.id}">${r.label}</button>`).join('')}
+      </div>
+    `);
+    this.wireModalClose();
+    document.querySelectorAll('[data-release-reason]').forEach(btn=>{
+      btn.onclick = ()=>{
+        const reason = this.RELEASE_CLAUSE_REASONS.find(r=>r.id===btn.dataset.releaseReason);
+        this.closeModal();
+        this.renderReleaseClauseConfirmModal(reason);
+      };
+    });
+  },
+  renderReleaseClauseConfirmModal(reason){
     const s = this.state; const p = s.player;
     const team = this.getTeam(p.teamId);
     const cost = this.releaseClauseCost();
@@ -8537,7 +9768,8 @@ Object.assign(App, {
       p.releaseClauseUsedThisContract = true; // reset to false again on the NEXT contract signed via the same reset points joinedTeamOnSeason already uses
       this.toast(`📝 You've requested a release from ${team.name}. Time to find a new seat.`);
       this.pushNews(`📝 ${p.name} requests an early release from ${team.name}.`);
-      p.journal.unshift({season:s.season, week:s.week, title:'Release Requested', text:`Paid $${cost.money.toFixed(1)}M to walk away from ${team.name} early, taking a ${cost.rep}-point media reputation hit.`, icon:'📝'});
+      const reasonText = reason ? reason.journalText : 'wanting a change';
+      p.journal.unshift({season:s.season, week:s.week, title:'Release Requested', text:`Paid $${cost.money.toFixed(1)}M to walk away from ${team.name} early, citing ${reasonText}.`, icon:'📝'});
       this.closeModal();
       this.saveState();
       this.renderContractOffersModal();
@@ -8654,6 +9886,7 @@ Object.assign(App, {
     const p = this.state.player;
     this.openModal(`
       ${this.modalHeader('Career Journal')}
+      <button class="pbtn full mint" id="btn-open-radio-log" style="margin-bottom:10px;">📻 Race Radio Log</button>
       ${p.journal.length===0 ? `<div class="empty-state"><div class="ic">📔</div>Your journal fills up as you race.</div>` :
         p.journal.slice(0,30).map(j=>`
           <div class="row-item" style="align-items:flex-start;">
@@ -8661,6 +9894,34 @@ Object.assign(App, {
             <span style="flex:1;"><div style="font-weight:800; font-size:12px;">${j.title}</div><div class="section-sub" style="margin:2px 0 0;">${j.text}</div></span>
           </div>
         `).join('')}
+    `);
+    this.wireModalClose();
+    document.getElementById('btn-open-radio-log').onclick = ()=> this.renderRadioLogModal();
+  },
+
+  /* Feature idea #22 -- full race radio/commentary log. A scrollable,
+     race-by-race transcript of every radio line settled in
+     renderRaceResultHtml() (app_race.js, where p.radioLog is written),
+     reviewable from this Journal-adjacent screen. Turns what used to be a
+     one-time, ephemeral flavor line per race into a persistent, readable
+     history. */
+  renderRadioLogModal(){
+    const p = this.state.player;
+    const log = p.radioLog || [];
+    this.openModal(`
+      ${this.modalHeader('Race Radio Log')}
+      ${log.length===0 ? `<div class="empty-state"><div class="ic">📻</div>Radio chatter from your races will show up here.</div>` :
+        log.map(r=>{
+          const catIcon = r.dnf ? '🔧' : r.category==='win' ? '🏆' : r.category==='podium' ? '🥉' : r.category==='points' ? '🏁' : '📻';
+          const posText = r.dnf ? 'DNF' : (r.position ? `P${r.position}` : '');
+          return `<div class="row-item" style="align-items:flex-start;">
+            <span style="font-size:18px;">${catIcon}</span>
+            <span style="flex:1;">
+              <div style="font-weight:800; font-size:11px;">${r.track||'Unknown Track'} ${posText ? `· ${posText}` : ''} <span style="font-weight:400; color:var(--ink-soft);">(Y${r.season}, Wk${r.week})</span></div>
+              <div class="section-sub" style="margin:2px 0 0; font-style:italic;">"${r.text}"</div>
+            </span>
+          </div>`;
+        }).join('')}
     `);
     this.wireModalClose();
   },
@@ -8712,7 +9973,9 @@ Object.assign(App, {
           return (ta?ta.name:a[0]).localeCompare(tb?tb.name:b[0]);
         }).map(([trackId,rec])=>{
           const track = TRACKS.find(t=>t.id===trackId);
-          return `<div class="row-item"><span class="rname">${track?track.name:trackId}</span><span class="rmeta">${rec.lapTimeText} · ${rec.driverName}${rec.isPlayer?' (you)':''}</span></div>`;
+          // Feature idea #2 -- personal best alongside the all-time record.
+          const myBest = (p.playerTrackBests||{})[trackId];
+          return `<div class="row-item"><span class="rname">${track?track.name:trackId}</span><span class="rmeta">${rec.lapTimeText} · ${rec.driverName}${rec.isPlayer?' (you)':''}</span></div>${myBest && !rec.isPlayer ? `<div class="section-sub" style="margin:-4px 0 6px; padding-left:2px;">your best here: ${myBest.lapTimeText}</div>` : ''}`;
         }).join('')}
       ` : ''}
 
@@ -8935,7 +10198,25 @@ Object.assign(App, {
     });
     const retirees = processGridRetirements(s);
     processStaffTurnover(s, retirees.length);
-    p.contract.years = Math.max(0, p.contract.years - 1);
+    // Driver market news ticker -- real AI-to-AI team switching (Pass 23
+    // backlog closure). Runs AFTER retirements/replacements have already
+    // settled for the season, so a driver who just retired this season
+    // can never also be swapped. Player and player's own teammate are
+    // never eligible -- see processDriverMarketMoves()'s own comment.
+    processDriverMarketMoves(s);
+    // Team Ownership Mode bugfix (Pass 25): p.contract.years was decrementing
+    // every season for an owner exactly the same as a real driver career,
+    // which meant an owner's contract would eventually hit 0 and force them
+    // through renderContractOffersModal() -- a full driver free-agency
+    // experience (browse other teams' offers, potentially a mid-career
+    // "Choose Your Teammate" pick) that makes no sense for someone who
+    // identified as a Team Principal, not a driver. There's no "owner
+    // free agency" system in this codebase (deliberately -- building one
+    // would be real scope creep past what Owner Mode is meant to be), so
+    // an owner's contract simply auto-renews with their own team every
+    // season instead of ever being allowed to hit 0.
+    if(p.isTeamOwner) p.contract.years = Math.max(p.contract.years, 1);
+    else p.contract.years = Math.max(0, p.contract.years - 1);
 
     // Performance-clause check: if this contract has a clause and it's
     // unmet, force the contract to expire right now regardless of years
@@ -8945,8 +10226,12 @@ Object.assign(App, {
     // already naturally reflects (a bad season = worse tiers anyway; this
     // just makes sure the SAME season's shortfall can't be papered over by
     // a contract that still had years left on it).
+    // Team Ownership Mode bugfix (Pass 25): skipped entirely for an owner
+    // -- a personal performance clause is a driver-contract concept, and
+    // forcing p.contract.years=0 here would undo the auto-renew just above
+    // and still route an owner into the driver free-agency flow.
     let clauseMissed = null;
-    if(p.contract.clause && p.contract.clause.met===null){
+    if(!p.isTeamOwner && p.contract.clause && p.contract.clause.met===null){
       const metNow = checkContractClauseMet(p.contract.clause, s, standing);
       p.contract.clause.met = metNow;
       if(!metNow){
@@ -9051,7 +10336,20 @@ Object.assign(App, {
       { label:'Podiums', playerVal: s.seasonStats.podiums||0, leaderVal: leader.careerStats.podiums||0 },
     ];
     const playerWonCategories = categories.filter(c=>c.playerVal>c.leaderVal).length;
-    return { leaderName: leader.name, leaderTeam: this.getTeam(leader.teamId).name, categories, playerWonCategories };
+    // Feature idea #3 -- a one-line shareable headline summary, purely
+    // string formatting over the SAME categories array above (no new
+    // comparison logic). Framed from the player's perspective, calling out
+    // how many categories they actually won as a quick shareable soundbite
+    // sitting under the fuller category breakdown.
+    const s2 = this.state;
+    const playerLabel = s2.player.age<=24 ? 'Rookie sensation' : this.standingPosition('player')<=3 ? 'Title contender' : 'Grid fighter';
+    const wonList = categories.filter(c=>c.playerVal>c.leaderVal).map(c=>c.label);
+    const shareHeadline = playerWonCategories===0
+      ? `${leader.name} sweeps every category against ${s2.player.name} this year.`
+      : playerWonCategories===categories.length
+      ? `${playerLabel} ${s2.player.name} sweeps ${leader.name} in every category.`
+      : `${playerLabel} ${s2.player.name} edges out ${leader.name} in ${playerWonCategories} of ${categories.length} categories${wonList.length ? ` (${wonList.join(', ')})` : ''}.`;
+    return { leaderName: leader.name, leaderTeam: this.getTeam(leader.teamId).name, categories, playerWonCategories, shareHeadline };
   },
 
   renderSeasonWrapModal({ standing, points, awards, completedObjectives, summary, yearNum, clauseMissed, teammateArcSummary, awardRewardLines, constructorsPos, constructorsPoints, teamName, paddockVote, roadmapMilestoneResult }){
@@ -9073,7 +10371,7 @@ Object.assign(App, {
       ${teammateArcSummary ? `<div class="pixel-panel"><div class="panel-title">🤜🤛 Teammate Battle</div><div class="section-sub" style="margin:0;">${teammateArcSummary.wins>teammateArcSummary.losses ? `You led ${teammateArcSummary.name} ${teammateArcSummary.wins}-${teammateArcSummary.losses} this season.` : teammateArcSummary.wins<teammateArcSummary.losses ? `${teammateArcSummary.name} led you ${teammateArcSummary.losses}-${teammateArcSummary.wins} this season.` : `Dead even with ${teammateArcSummary.name}, ${teammateArcSummary.wins}-${teammateArcSummary.losses}.`}</div></div>` : ''}
       ${awards.length ? `<div class="pixel-panel"><div class="panel-title">Season Awards</div><div class="pbtn-row">${awards.map(a=>`<span class="chip gold">🏅 ${a}</span>`).join('')}</div>${(awardRewardLines||[]).map(r=>`<div class="section-sub" style="margin:6px 0 0;">🏅 ${r.award}: ${r.desc}</div>`).join('')}</div>` : ''}
       ${completedObjectives.length ? `<div class="pixel-panel"><div class="panel-title">Objectives Completed</div>${completedObjectives.map(o=>`<div class="section-sub" style="margin:4px 0;">🎯 ${o.text} — +$${o.reward.money}M, +${o.reward.rep} reputation</div>`).join('')}</div>` : ''}
-      ${paddockVote ? `<div class="pixel-panel"><div class="panel-title">🗳️ Paddock Vote: You vs. ${paddockVote.leaderName}</div><div class="section-sub" style="margin:0 0 6px;">A purely cosmetic look at how you stacked up against the championship leader (${paddockVote.leaderTeam}) this year.</div>${paddockVote.categories.map(c=>`<div class="row-item"><span class="rname">${c.label}</span><span class="rmeta">${c.playerVal>c.leaderVal?'🟢':c.playerVal<c.leaderVal?'🔴':'⚪'} You ${c.playerVal} — ${c.leaderVal} them</span></div>`).join('')}<div class="section-sub" style="margin-top:6px;">${paddockVote.playerWonCategories>=2?"The paddock is buzzing about your season.":paddockVote.playerWonCategories===1?'A mixed year, but real bright spots.':'Room to grow — next year is a fresh shot.'}</div></div>` : ''}
+      ${paddockVote ? `<div class="pixel-panel"><div class="panel-title">🗳️ Paddock Vote: You vs. ${paddockVote.leaderName}</div><div class="section-sub" style="margin:0 0 6px;">A purely cosmetic look at how you stacked up against the championship leader (${paddockVote.leaderTeam}) this year.</div>${paddockVote.categories.map(c=>`<div class="row-item"><span class="rname">${c.label}</span><span class="rmeta">${c.playerVal>c.leaderVal?'🟢':c.playerVal<c.leaderVal?'🔴':'⚪'} You ${c.playerVal} — ${c.leaderVal} them</span></div>`).join('')}<div class="section-sub" style="margin-top:6px;">${paddockVote.playerWonCategories>=2?"The paddock is buzzing about your season.":paddockVote.playerWonCategories===1?'A mixed year, but real bright spots.':'Room to grow — next year is a fresh shot.'}</div>${paddockVote.shareHeadline ? `<div class="chip gold" style="margin-top:8px; display:block; text-align:center;">📰 "${paddockVote.shareHeadline}"</div>` : ''}</div>` : ''}
       <div class="section-sub" style="margin:4px 0 10px;">🔧 A quiet offseason still costs a little sharpness — your stats have faded slightly. Keep training to stay ahead.</div>
       <button class="pbtn full gold" id="btn-next-season">Continue</button>
     `);
@@ -9098,7 +10396,17 @@ Object.assign(App, {
       if(this.activeModal) this.activeModal.onclick = null;
       document.getElementById('btn-next-season').onclick = ()=>{
         this.closeModal();
-        if(p.age>=42){
+        // Team Ownership Mode bugfix (Pass 25): the age>=42 retirement
+        // offer leads into a whole driver-career-legacy system (Hall of
+        // Fame entry, legend-driver carryover) that's fundamentally about
+        // a DRIVING career ending -- there's no equivalent "team owner
+        // legacy" system built (deliberately -- see the contract-renewal
+        // fix just above for the same "not building an owner-specific
+        // parallel system" reasoning), so an owner simply keeps running
+        // their team past 42 rather than being routed into a retirement
+        // flow that's entirely about a driving career they were never
+        // personally living out in the first place.
+        if(p.age>=42 && !p.isTeamOwner){
           this.offerRetirement();
         } else if(p.contract.years<=0){
           this.renderContractOffersModal();
@@ -9363,7 +10671,7 @@ Object.assign(App, {
     document.getElementById('btn-postgame-legacy').onclick = ()=> this.renderLegacyPerkModal();
     document.getElementById('btn-postgame-retrospective').onclick = ()=> this.renderCareerRetrospectiveModal();
     document.getElementById('btn-postgame-museum').onclick = ()=> this.renderMuseumModal();
-    document.getElementById('btn-postgame-legend-replay').onclick = ()=> this.renderLegendExhibitionModal();
+    document.getElementById('btn-postgame-legend-replay').onclick = ()=> this.renderLegendExhibitionTrackPicker();
   },
 
   /* ---------------- LEGEND EXHIBITION (feature idea #17) ----------------
@@ -9402,7 +10710,31 @@ Object.assign(App, {
     const teamsShuffled = [...TEAMS].sort(()=>Math.random()-0.5);
     const ownLegend = makeLegendDriver(p, teamsShuffled[0].id);
     grid.push(ownLegend);
-    const poolShuffled = [...this.LEGEND_EXHIBITION_POOL].sort(()=>Math.random()-0.5).slice(0, 21);
+    // Feature idea #17 -- pull the opponent pool from the player's own real
+    // Hall of Fame entries (loadHallOfFame(), engine.js) when available,
+    // falling back to the existing fixed LEGEND_EXHIBITION_POOL flavor pool
+    // when the Hall of Fame is empty (a brand new save, or one where no
+    // career has retired into it yet) -- instead of always using the fixed
+    // 20-name list regardless of how many real retired careers exist. Real
+    // entries read {name, flag, nationality} straight off
+    // buildHallOfFameEntry()'s own shape (engine.js), same fields the
+    // fixed-pool path already provides, so downstream code below needs no
+    // branching of its own.
+    const hof = loadHallOfFame();
+    const usingRealHof = hof.length > 0;
+    const sourcePool = usingRealHof
+      ? hof.map(entry=>({ name: entry.name, nationality: entry.nationality }))
+      : this.LEGEND_EXHIBITION_POOL;
+    const poolShuffled = [...sourcePool].sort(()=>Math.random()-0.5).slice(0, 21);
+    // If the real Hall of Fame has FEWER than 21 entries, top up the rest
+    // from the fixed flavor pool rather than running a short/empty field --
+    // "falls back correctly when empty" also has to cover "falls back
+    // correctly when merely not enough yet", not just the zero case.
+    if(poolShuffled.length < 21){
+      const usedNames = new Set(poolShuffled.map(e=>e.name));
+      const topUp = this.LEGEND_EXHIBITION_POOL.filter(e=>!usedNames.has(e.name));
+      poolShuffled.push(...[...topUp].sort(()=>Math.random()-0.5).slice(0, 21-poolShuffled.length));
+    }
     poolShuffled.forEach((entry, i)=>{
       const teamId = teamsShuffled[(i+1) % teamsShuffled.length].id;
       const legend = makeRivalDriver(entry.name, teamId);
@@ -9418,12 +10750,40 @@ Object.assign(App, {
     });
     return grid;
   },
-  renderLegendExhibitionModal(){
-    const s = this.state; const p = s.player;
-    const track = pick(TRACKS.filter(t=>t.permanent));
+  /* Feature idea #5 -- let the player pick the track from a short list
+     before running, instead of always randomizing it. Reuses the same
+     permanent-tracks pool renderLegendExhibitionModal() always randomized
+     from -- just surfaces a short (6-track) sample of it as a picker
+     instead of pre-selecting one via pick(). */
+  renderLegendExhibitionTrackPicker(){
+    const permanentTracks = TRACKS.filter(t=>t.permanent);
+    const choices = [...permanentTracks].sort(()=>Math.random()-0.5).slice(0, 6);
     this.openModal(`
       ${this.modalHeader('Legend Exhibition')}
-      <div class="section-sub" style="margin-bottom:10px;">A curated "greatest grid ever" one-off exhibition at ${track.name}, featuring ${p.name} alongside 21 legendary AI drivers from across the sport's history. Purely for fun — nothing here is saved or counted toward any record.</div>
+      <div class="section-sub" style="margin-bottom:10px;">Pick a circuit for this one-off "greatest grid ever" exhibition.</div>
+      <div class="stack-8">
+        ${choices.map(t=>`<button class="pbtn full" data-legend-track="${t.id}">${t.country} — ${t.name}</button>`).join('')}
+      </div>
+    `);
+    this.wireModalClose();
+    document.querySelectorAll('[data-legend-track]').forEach(btn=>{
+      btn.onclick = ()=>{
+        const track = TRACKS.find(t=>t.id===btn.dataset.legendTrack);
+        this.closeModal();
+        this.renderLegendExhibitionModal(track);
+      };
+    });
+  },
+  renderLegendExhibitionModal(chosenTrack){
+    const s = this.state; const p = s.player;
+    const track = chosenTrack || pick(TRACKS.filter(t=>t.permanent));
+    const hofCount = loadHallOfFame().length;
+    const fieldNote = hofCount>0
+      ? `featuring ${p.name} alongside 21 legendary drivers drawn from your own Hall of Fame${hofCount<21?' (topped up with classic flavor legends)':''}.`
+      : `featuring ${p.name} alongside 21 legendary AI drivers from across the sport's history.`;
+    this.openModal(`
+      ${this.modalHeader('Legend Exhibition')}
+      <div class="section-sub" style="margin-bottom:10px;">A curated "greatest grid ever" one-off exhibition at ${track.name}, ${fieldNote} Purely for fun — nothing here is saved or counted toward any record.</div>
       <button class="pbtn full gold" id="btn-run-legend-exhibition">🏁 Run Exhibition Race</button>
     `);
     this.wireModalClose();
@@ -9617,11 +10977,23 @@ const TUTORIAL_STEPS = [
 
 Object.assign(App, {
 
+  /* Bugfix: this previously opened via setTimeout(..., 400), which left a
+     genuine window (hub fully rendered and clickable, tutorial not yet
+     open) where a fast player's very first tap on the hub -- most
+     commonly "End Day" -- could land in that gap and then get silently
+     swallowed the instant the tutorial modal appeared on top of it a
+     moment later (confirmed reproducible: elementFromPoint at the
+     button's own coordinates resolves to the newly-opened .modal-overlay,
+     not the button, even though the button itself is still present and
+     enabled underneath). Opening synchronously here, in the same tick as
+     renderHub() finishes wiring the hub's own buttons, closes that window
+     entirely -- the tutorial is now always on top BEFORE the hub is ever
+     interactive, never after. */
   maybeShowTutorial(){
     if(!this.state.tutorialSeen){
       this.state.tutorialSeen = true;
       this.saveState();
-      setTimeout(()=> this.renderTutorialModal(0), 400);
+      this.renderTutorialModal(0);
     }
   },
 
