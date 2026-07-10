@@ -191,9 +191,19 @@ input,select,textarea{font-family:inherit;}
   50%{ transform:translateY(-8px) scaleX(1.03); }
   55%{ transform:translateY(-7px) scaleX(1); }
 }
+/* Bugfix: this previously sat at bottom-right (bottom:-2px; right:2px),
+   almost exactly overlapping #pod-profile-btn (the 🎨 customize button,
+   also positioned near the pod's bottom-right corner) -- confirmed via a
+   live geometry check: the two elements' bounding boxes were only a few
+   pixels apart, both ~32-34px, reading as one messy overlapping cluster
+   rather than two distinct controls. Moved to top-right instead, a
+   natural "status indicator" spot that's clear of every other pod
+   control (profile button stays bottom-right, the optional colorway
+   swatch badge stays bottom-left -- see the second .pod-mood-badge use
+   in renderHub(), app_hub.js). */
 .pod-mood-badge{
   position:absolute;
-  bottom:-2px; right:2px;
+  top:-2px; right:2px;
   background:var(--candy-yellow);
   border:3px solid var(--pixel-border);
   border-radius:50%;
@@ -1276,7 +1286,7 @@ const RANDOM_EVENTS = [
    pool. */
 const CELEBRITY_POOL = [
   // ---- Common (fanPopularity 40+) ----
-  {id:'chef_marco', name:'Marco Estrella', type:'Celebrity Chef', rarity:'Common', icon:'👨‍🍳', fanMin:40,
+  {id:'chef_marco', name:'Marco Estrella', type:'Celebrity Chef', rarity:'Common', icon:'🍳', fanMin:40,
    fanGain:[3,7], rumorChance:0.05, bio:'Runs a chain of trendy restaurants; loves being seen with athletes.'},
   {id:'streamer_nyx', name:'Nyx Kellan', type:'Streaming Star', rarity:'Common', icon:'🎮', fanMin:40,
    fanGain:[3,7], rumorChance:0.08, bio:'Massive online following; a shoutout from them travels fast.'},
@@ -3360,7 +3370,14 @@ const App = {
         <div class="option-grid" id="grid-team" style="margin-bottom:20px;">
           ${TEAMS.map(t=>{
             const locked = !teamUnlockedForDifficulty(t, cfg.difficulty);
-            return `<div class="option-card ${cfg.teamId===t.id?'selected':''}" data-val="${t.id}" ${locked?'style="opacity:0.4; cursor:not-allowed;" data-locked="1"':''}>${t.flag} ${t.name}<br><span style="color:var(--ink-soft); font-size:9px;">${locked?'🔒 Locked this difficulty':'Car '+t.carStrength}</span></div>`;
+            // Bugfix: the lock indicator was a small 9px grey label easy to
+            // miss next to a merely-dimmed (40% opacity) card, with a
+            // silent no-op on click (see wireOptionGrid's own fix above) --
+            // together these made it genuinely easy to believe a locked
+            // team was actually selected. Bumped the lock label to a
+            // clearer red, bold treatment so it reads as a real blocker at
+            // a glance, not a faint footnote.
+            return `<div class="option-card ${cfg.teamId===t.id?'selected':''}" data-val="${t.id}" ${locked?'style="opacity:0.5; cursor:not-allowed;" data-locked="1"':''}>${t.flag} ${t.name}<br><span style="${locked?'color:var(--candy-red); font-weight:800;':'color:var(--ink-soft);'} font-size:9px;">${locked?'🔒 LOCKED — this difficulty':'Car '+t.carStrength}</span></div>`;
           }).join('')}
         </div>
 
@@ -3371,6 +3388,7 @@ const App = {
           <div class="option-card ${cfg.ownerMode?'selected':''}" data-val="owner">🏗️ Team Owner</div>
         </div>
 
+        <div class="section-sub" style="text-align:center; margin-bottom:8px;">Starting team: <b>${TEAMS.find(t=>t.id===cfg.teamId).flag} ${TEAMS.find(t=>t.id===cfg.teamId).name}</b></div>
         <button class="pbtn full gold" id="btn-start-career">Choose Teammate & Start Career</button>
         <button class="pbtn full" id="btn-back-title" style="margin-top:10px;">Back</button>
       </div>
@@ -3644,7 +3662,20 @@ const App = {
   wireOptionGrid(gridId, onSelect, skipLocked){
     const grid = document.getElementById(gridId);
     grid.querySelectorAll('.option-card').forEach(card=>{
-      if(skipLocked && card.dataset.locked) return; // locked cards aren't clickable at all
+      // Bugfix: a locked card previously had NO click handler wired at all
+      // (skipLocked's early `return` below skipped it entirely), so
+      // clicking it was a completely silent no-op -- no toast, no shake,
+      // nothing. Confirmed as a real source of confusion: a player who
+      // clicks a greyed-out, small-lock-text team card can easily believe
+      // their pick registered (nothing on screen says otherwise) and only
+      // discover much later -- e.g. at the Championship Standings screen,
+      // seeing an unexpected teammate -- that the default team/teammate
+      // was used instead. Now gives an explicit toast explaining WHY the
+      // click didn't do anything, rather than staying silent.
+      if(skipLocked && card.dataset.locked){
+        card.onclick = ()=> this.toast('🔒 Locked at this difficulty — pick a lower difficulty or a different team.');
+        return;
+      }
       card.onclick = ()=>{
         grid.querySelectorAll('.option-card').forEach(c=>c.classList.remove('selected'));
         card.classList.add('selected');
@@ -4482,7 +4513,7 @@ Object.assign(App, {
       {id:'golf', label:'Golfing', icon:'⛳', cost:8, mood:10, stress:12, energyGain:6},
       {id:'padel', label:'Padel', icon:'🎾', cost:12, mood:9, stress:9, fitness:2, energyGain:2},
       {id:'stream', label:'Streaming', icon:'🎮', cost:2, mood:12, stress:4, fans:2, energyGain:10},
-      {id:'family', label:'Visit Family', icon:'👨‍👩‍👧', cost:0, mood:16, stress:18, energyGain:14},
+      {id:'family', label:'Visit Family', icon:'🏡', cost:0, mood:16, stress:18, energyGain:14},
       {id:'cook', label:'Cook a Meal', icon:'🍳', cost:0, mood:7, stress:7, energyGain:10},
       {id:'read', label:'Read a Book', icon:'📖', cost:0, mood:5, stress:10, energyGain:12},
       {id:'replay', label:'Watch Replays', icon:'📺', cost:2, mood:2, stress:0, focus:2, energyGain:8},
@@ -5776,8 +5807,21 @@ Object.assign(App, {
     return '😣';
   },
 
+  /* Bugfix: this previously returned a ZWJ (zero-width-joiner) compound
+     emoji -- '👩\u200d🏎️'/'🧑\u200d🏎️' ("woman"/"person" + ZWJ + "racing
+     car"), designed to render as ONE fused "racing driver" glyph. That
+     depends entirely on the font/browser supporting that specific
+     ligature. Where it isn't supported, the two component emoji render
+     SEPARATELY instead of fusing -- a face on the left, a race car
+     bleeding out to the right past the circular pod's bounds, with the
+     ZWJ/variation-selector character itself sometimes rendering as its
+     own small stray glyph -- confirmed reproducible via a live geometry
+     check: the emoji's rendered bounding box (159.7px) was wider than the
+     150px pod itself, even though it was correctly centered by CSS.
+     Switched to single, non-compound emoji with no ZWJ dependency at all,
+     which render identically everywhere. */
   driverSprite(p){
-    return p.gender==='F' ? '👩‍🏎️' : '🧑‍🏎️';
+    return p.gender==='F' ? '👩' : '🧑';
   },
 
   /* Feature idea #18 -- livery/car colorway swatch, shown on the driver pod
@@ -5886,8 +5930,7 @@ Object.assign(App, {
       <div class="pod-wrap" style="position:relative;">
         <div class="pod" id="pod-tap">
           <span class="pod-sprite">${this.driverSprite(p)}</span>
-          <span class="pod-mood-badge">${this.moodEmoji(p.attributes.lifestyle.mood)}</span>
-          ${p.carColorway && p.carColorway!=='colorway_default' ? `<span class="pod-mood-badge" style="left:-4px; right:auto;" title="Car colorway">${this.colorwaySwatchIcon(p)}</span>` : ''}
+          ${p.carColorway && p.carColorway!=='colorway_default' ? `<span class="pod-mood-badge" style="top:auto; bottom:-2px; left:-4px; right:auto;" title="Car colorway">${this.colorwaySwatchIcon(p)}</span>` : ''}
         </div>
         <button id="pod-profile-btn" title="Driver Profile" style="position:absolute; right:calc(50% - 75px); bottom:2px; width:32px; height:32px; border-radius:50%; border:2px solid var(--pixel-border); background:var(--candy-yellow); font-size:14px; cursor:pointer; box-shadow:0 2px 0 var(--pixel-border);">🎨</button>
       </div>
@@ -11066,7 +11109,7 @@ const HELP_TOPICS = [
   {icon:'🌟', title:'Celebrity Encounters', text:'High Fan Popularity means occasional celebrity run-ins. Leaning into publicity gives a bigger boost but more rumor risk, while staying low-key is safer but smaller.'},
   {icon:'🏆', title:'Career Journal & Museum', text:'Every milestone is recorded automatically in your Journal, and archived in the Hall of Fame Museum too.'},
   {icon:'🏠', title:'Home Tracks', text:'Race at a circuit enough (85%+ familiarity, built through Practice) and it becomes a Home Track — a small permanent pace bonus on top of the usual familiarity edge, shown with a badge on Race Center.'},
-  {icon:'🧑‍💼', title:'Your Manager', text:'Your Manager negotiates on your behalf — ask about contract leverage for an honest read on your current negotiating position, or check in on sponsor leads for a heads-up before a deal shows up in Sponsors.'},
+  {icon:'💼', title:'Your Manager', text:'Your Manager negotiates on your behalf — ask about contract leverage for an honest read on your current negotiating position, or check in on sponsor leads for a heads-up before a deal shows up in Sponsors.'},
   {icon:'🏆', title:"Constructors' Championship", text:"Both drivers' points count toward their team's own Constructors' total, tracked separately from the Drivers' Championship. Check it on Team & Car. Points earned stay with the team you scored them for, even if you switch teams mid-season."},
   {icon:'📰', title:'Controversy Moments', text:'Occasionally a standalone media flashpoint appears between races — how you respond swings Fan Popularity and Media Reputation in opposite directions, so pick the trade-off that fits the driver you\'re building.'},
   {icon:'🛞', title:'Pit-Stop Strategy', text:'Alongside tire compound, you can call an Undercut (pit early — higher risk, higher reward) or Overcut (stay out — safer, smaller upside) before the race. The result shows up as a small position swing in your race report.'},
